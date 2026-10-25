@@ -173,42 +173,43 @@ MusicXML-only 路径（跳过 OMR）：
 
 ---
 
-## 5. Core ML 适配结果（真实数字，不好看但可信）
+## 5. Core ML 适配结果（默认开启，数字与取舍）
 
 实现方式：**不自己写 provider 管线**。homr 0.7 已内置 Apple 支持，本仓库要做的只是把开关接上（F6）并按平台语义分配：
 
-| 模型 | 后端 | 理由 |
+| 模型 | 后端（交付默认） | 理由 |
 |---|---|---|
 | segnet | CoreML EP（`MLProgram`, `CPUAndGPU`） | fp16 模型，MLProgram 才能真正把节点放到 GPU/ANE |
-| transformer encoder | CoreML EP（opt-in `coreml_encoder=True`） | 必须配 fp16 权重 |
+| transformer encoder | **CPU fp32**（`HOMR_COREML_ENCODER=1` 可切 CoreML） | 每行谱表一次 CoreML 调用，实测多 ~4 s/页 |
 | transformer decoder | **CPU fp32** | CoreML EP 跑不了动态 KV-cache 维度，强行放会崩 |
 
-单页（`曲笛.pdf` 第 1 页）对照，同机、同输入、各跑两次：
+> 早期版本还把 encoder 放到 CoreML，那一版单页 12.2–13.7 s；改成 segnet-only 后降到 8.3–8.4 s，整本从 +11% 变成基本持平。
 
-| 后端 | wall | 峰值 RSS | 小节 | 音符 | 与 CPU 的差异 |
-|---|---|---|---|---|---|
-| cpu | **5.09–5.11 s** | 1190–1211 MB | 46 | 164 | —（基准） |
-| coreml | **12.23–13.68 s** | 1272–1273 MB | 46 | 164 | 小节/音符/休止/音高序列 **完全一致** |
+单页（`曲笛.pdf` 第 1 页），各跑两次：
+
+| 后端 | wall | 峰值 RSS | 音符 | 与 CPU 的差异 |
+|---|---|---|---|---|
+| cpu | **4.84–4.85 s** | 1190–1210 MB | 164 | —（基准） |
+| coreml（segnet only） | **8.34–8.41 s** | 1272 MB | 164 | 逐音全等 |
 
 整本 5 页（193 小节、804 音符）：
 
 | 后端 | wall | 峰值 RSS | 与 CPU 的差异 |
 |---|---|---|---|
-| cpu | **21.63 s** | 1695 MB | —（基准） |
-| coreml | **24.16 s** | 1723 MB | 全等（逐音音高序列相同） |
+| cpu | **20.87 s** | 1688 MB | —（基准） |
+| coreml（segnet only） | **21.06 s** | 1944 MB | 逐音全等 |
 
-即：单页慢 2.4×，整本慢 11%——开销主要是每页重建 Core ML session 的固定成本。
+配置对比（同页，用于定默认值）：CPU 4.88 s；segnet-only 8.61 s；segnet+encoder 12.54 s；`MLComputeUnits=ALL` 20.59 s。
 
 编译缓存确认已生成（证明真的走了 Core ML，而不是静默回退）：
-`homr/segmentation/*_fp16.coreml_cache` 55 MB、`homr/transformer/*_fp16.coreml_cache` 182 MB。
+`homr/segmentation/*_fp16.coreml_cache` 55 MB（开启 encoder 另有 182 MB）。
 
-**结论**：在当前 onnxruntime 1.31.0 + homr 0.7.0 组合下，Core ML 对这份样例**是净减速**（约 2.4×），原因是每页新建 session 的编译/绑定开销远大于小页推理收益；准确率无退化。因此：
-- 默认仍是 `auto`，但**在 macOS 上默认解析为 CPU**（见 `_resolve_inference_backend`），只有显式 `--backend coreml` 才启用；这与"CPU 基线优先、Core ML 不阻塞主链路"的交接要求一致；
-- 是否值得继续投入，取决于多页整本谱的摊销结果（见 `docs/bench_coreml_full.json` 与 `docs/coreml_plan.md`）。
+**结论**：按"开箱即用 Apple 加速"的产品决策，`auto` 在 Apple Silicon 上**默认解析为 Core ML（segnet-only）**：
+- 整本分谱与 CPU 基本持平（+0.9%），但计算落在 GPU/ANE，CPU 更空闲；
+- 单页片段慢约 1.7×，因此 `--backend cpu` / `HOMR_BACKEND=cpu` 被明确写成"短片段快路径"；
+- 准确率无退化（逐音序列全等）；失败会回退 CPU 并打印**实际**后端。
 
-> 交接文档 §5-B 要求"不能因为检测到 CoreMLExecutionProvider 就宣布加速"。本次审计正好验证了这条：**第一次接上时确实没生效**（F5），修好后才测出"生效但更慢"。
-
----
+> 交接文档 §5-B 要求"不能因为检测到 CoreMLExecutionProvider 就宣布加速"。本次审计正好验证了这条：**第一次接上时确实没生效**（F5），修好后才测出真实差异，并据此选了 segnet-only。
 
 ## 6. 许可证与发行风险（AGPL 复核）
 

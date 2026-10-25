@@ -40,12 +40,19 @@ class BackendResolutionTest(unittest.TestCase):
         self.assertTrue(bk['segnet_gpu'])
         self.assertFalse(bk['transformer_gpu'],
                          'decoder cannot run on the Core ML EP; transformer must stay CPU')
-        self.assertTrue(bk['coreml_encoder'])
 
-    def test_auto_is_cpu_on_mac_unless_asked(self):
-        # Measured slower on macOS (docs/coreml_plan.md); acceleration is opt-in.
+    def test_coreml_encoder_is_opt_in(self):
         with _providers('CPUExecutionProvider', 'CoreMLExecutionProvider'):
-            self.assertEqual(homr_runner._resolve_inference_backend('auto')['name'], 'cpu')
+            self.assertFalse(homr_runner._resolve_inference_backend('coreml')['coreml_encoder'],
+                             'segnet-only is the faster shipped default')
+        with _providers('CPUExecutionProvider', 'CoreMLExecutionProvider'), \
+                mock.patch.dict(os.environ, {'HOMR_COREML_ENCODER': '1'}):
+            self.assertTrue(homr_runner._resolve_inference_backend('coreml')['coreml_encoder'])
+
+    def test_auto_accelerates_on_mac(self):
+        # Product decision: Apple acceleration works out of the box.
+        with _providers('CPUExecutionProvider', 'CoreMLExecutionProvider'):
+            self.assertEqual(homr_runner._resolve_inference_backend('auto')['name'], 'coreml')
 
     def test_auto_prefers_cuda_when_present(self):
         with _providers('CPUExecutionProvider', 'CUDAExecutionProvider'):

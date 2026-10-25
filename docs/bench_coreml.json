@@ -7,29 +7,29 @@
       "attempts": [
         {
           "backend": "cpu",
-          "wall_s": 5.109371499987901,
-          "peak_rss_mb": 1211.078125,
+          "wall_s": 4.837944457991398,
+          "peak_rss_mb": 1209.796875,
           "error": null,
           "run": 1,
-          "musicxml": "/var/folders/5k/76rtlln94zq5lf6mmdgtsngr0000gn/T/bench_backends_gl94x7k4/cpu_0/homr_input.musicxml",
+          "musicxml": "/var/folders/5k/76rtlln94zq5lf6mmdgtsngr0000gn/T/bench_backends_tszizzvd/cpu_0/homr_input.musicxml",
           "measures": 46,
           "notes": 164,
           "rests": 28
         },
         {
           "backend": "cpu",
-          "wall_s": 5.093524458992761,
-          "peak_rss_mb": 1189.921875,
+          "wall_s": 4.851282125004218,
+          "peak_rss_mb": 1190.84375,
           "error": null,
           "run": 2,
-          "musicxml": "/var/folders/5k/76rtlln94zq5lf6mmdgtsngr0000gn/T/bench_backends_gl94x7k4/cpu_1/homr_input.musicxml",
+          "musicxml": "/var/folders/5k/76rtlln94zq5lf6mmdgtsngr0000gn/T/bench_backends_tszizzvd/cpu_1/homr_input.musicxml",
           "measures": 46,
           "notes": 164,
           "rests": 28
         }
       ],
-      "best_wall_s": 5.093524458992761,
-      "peak_rss_mb": 1211.078125,
+      "best_wall_s": 4.837944457991398,
+      "peak_rss_mb": 1209.796875,
       "notes": 164,
       "measures": 46
     },
@@ -37,29 +37,29 @@
       "attempts": [
         {
           "backend": "coreml",
-          "wall_s": 13.681267250009114,
-          "peak_rss_mb": 1272.9375,
+          "wall_s": 8.409450416002073,
+          "peak_rss_mb": 1272.015625,
           "error": null,
           "run": 1,
-          "musicxml": "/var/folders/5k/76rtlln94zq5lf6mmdgtsngr0000gn/T/bench_backends_gl94x7k4/coreml_0/homr_input.musicxml",
+          "musicxml": "/var/folders/5k/76rtlln94zq5lf6mmdgtsngr0000gn/T/bench_backends_tszizzvd/coreml_0/homr_input.musicxml",
           "measures": 46,
           "notes": 164,
           "rests": 28
         },
         {
           "backend": "coreml",
-          "wall_s": 12.228438541991636,
-          "peak_rss_mb": 1271.828125,
+          "wall_s": 8.337195457992493,
+          "peak_rss_mb": 1271.984375,
           "error": null,
           "run": 2,
-          "musicxml": "/var/folders/5k/76rtlln94zq5lf6mmdgtsngr0000gn/T/bench_backends_gl94x7k4/coreml_1/homr_input.musicxml",
+          "musicxml": "/var/folders/5k/76rtlln94zq5lf6mmdgtsngr0000gn/T/bench_backends_tszizzvd/coreml_1/homr_input.musicxml",
           "measures": 46,
           "notes": 164,
           "rests": 28
         }
       ],
-      "best_wall_s": 12.228438541991636,
-      "peak_rss_mb": 1272.9375,
+      "best_wall_s": 8.337195457992493,
+      "peak_rss_mb": 1272.015625,
       "notes": 164,
       "measures": 46
     }

@@ -180,14 +180,27 @@ python jianpu.py 曲笛.pdf --backend cpu --mode insitu --engine strip -o ../out
 
 ---
 
-## 7. Core ML（可选，默认关闭）
+## 7. Core ML / Apple 加速（默认开启）
+
+在 Apple Silicon 上，`--backend auto`（默认）会启用 **Core ML**：segnet 跑在 GPU/ANE，transformer 留在 CPU（decoder 无法上 Core ML）。无需任何参数：
 
 ```bash
-python jianpu.py 曲笛.pdf --backend coreml --mode jianpu -o ../output/qudi_ml
+python jianpu.py 曲笛.pdf --mode jianpu -o ../output/qudi
+# 日志首行会写明实际后端：[homr] 推理后端: CoreML（仅 segnet，encoder/decoder 在 CPU）
 ```
 
-- 首次运行会把 segnet/encoder 编译成 MLProgram，并在模型文件旁生成 `*.coreml_cache`（约 240 MB）。
-- 实测**单页 12.2–13.7 s vs CPU 5.1 s（约慢 2.4×）**，音符/小节/音高序列与 CPU 完全一致。
+实测（本机，同输入）：
+
+| 场景 | CPU | Apple 加速（默认） | 说明 |
+|---|---|---|---|
+| 整本 5 页 / 193 小节 | 20.87 s | **21.06 s** | 基本持平，计算在 GPU/ANE |
+| 单页 5 行谱表 | 4.84 s | 8.34–8.41 s | 固定开销摊不开，慢约 1.7× |
+
+因此：
+
+- **整本分谱**：用默认（Apple 加速）。
+- **单页片段 / 大量短 PDF 批处理 / CI**：`--backend cpu`（或 `export HOMR_BACKEND=cpu`）更快。
+- 首次运行会生成 `homr/segmentation/*_fp16.coreml_cache`（约 55 MB）；若开启 encoder 另需 182 MB。
 - 想量化对比：
 
 ```bash
@@ -195,7 +208,10 @@ python scripts/bench_backends.py --pdf 曲笛.pdf --page 1 --backends cpu,coreml
     --out docs/bench_coreml.json
 ```
 
-- 也可用环境变量给 GUI/其他入口设默认后端：`export HOMR_BACKEND=coreml`。
+- 实验开关（都不是默认值）：
+  - `HOMR_COREML_ENCODER=1` 把 encoder 也放上 Core ML（实测更慢）；
+  - `HOMR_COREML_COMPUTE_UNITS=ALL` 使用 ANE（实测明显更慢，20.59 s vs 12.54 s）。
+- 若某台机器 Core ML 异常，推理会自动回退 CPU 重试，日志以**实际**后端为准。
 
 ---
 
@@ -217,10 +233,11 @@ python -m unittest discover -s tests -v
 |---|---|
 | `LILYPOND` | 直接指定 LilyPond 可执行文件（`insitu` 用） |
 | `LILYPOND_PATH` / `LILYPOND_HOME` | `core/render/lilypond_runner.py` 的查找根 |
-| `HOMR_BACKEND` | `auto` / `cpu` / `coreml` / `cuda`，CLI `--backend` 优先 |
+| `HOMR_BACKEND` | `auto` / `cpu` / `coreml` / `cuda`，CLI `--backend` 优先；macOS 默认 `auto`→coreml |
 | `SUMISORA_ROOT` | 用外部 SumisoraOMR 覆盖内置 `core/` |
 | `XDG_CACHE_HOME` | 给 fontconfig 一个可写的缓存目录 |
-| `HOMR_COREML_COMPUTE_UNITS` | `ALL`（默认，ANE+GPU+CPU）/ `CPUAndGPU` |
+| `HOMR_COREML_ENCODER` | `1` = encoder 也上 Core ML（默认 `0`，仅 segnet） |
+| `HOMR_COREML_COMPUTE_UNITS` | 覆盖 homr 的 `CPUAndGPU`（可选 `ALL` / `CPUOnly`；实测 `ALL` 更慢） |
 | `HOMR_COREML_MODEL_CACHE_DIR` | 覆盖 Core ML 编译缓存位置 |
 
 ---

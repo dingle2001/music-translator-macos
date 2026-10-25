@@ -449,20 +449,28 @@ def _resolve_inference_backend(requested: Optional[str] = None) -> dict:
     has_coreml = 'CoreMLExecutionProvider' in providers
 
     if backend == 'auto':
-        # Deliberately *not* Core ML on macOS: measured slower than the CPU EP
-        # (11% on a 5-page vector score, 140% on a single page — see
-        # docs/coreml_plan.md), because homr builds a fresh session per page and
-        # the MLProgram compile/bind cost is paid per session.  Accelerators are
-        # opt-in: --backend coreml / --backend cuda.
-        backend = 'cuda' if has_cuda else 'cpu'
+        # Apple Silicon: default to Core ML so acceleration works out of the box
+        # (product decision, 2026-10-25).  Measured: still slower than the CPU EP
+        # on our samples (8.6 s vs 4.9 s for a page, see docs/coreml_plan.md), so
+        # `--backend cpu` / $HOMR_BACKEND=cpu stays the documented fast path.
+        backend = 'cuda' if has_cuda else ('coreml' if has_coreml else 'cpu')
     if backend == 'cuda' and not has_cuda:
         backend = 'cpu'
     if backend == 'coreml' and not has_coreml:
         backend = 'cpu'
 
     if backend == 'coreml':
+        # The transformer encoder is a separate opt-in even inside homr.  It can
+        # be slower than the CPU fp32 encoder on short scores (one Core ML call
+        # per staff line), so keep it switchable for measurement/rollback.
+        # Off by default: the Core ML encoder is one call per staff line and was
+        # ~4 s slower than the CPU encoder on a 5-staff page, so the shipped
+        # default accelerates segnet only.  Set HOMR_COREML_ENCODER=1 to opt in.
+        encoder_on = os.environ.get('HOMR_COREML_ENCODER', '0').strip() not in ('0', '', 'false')
         return {'name': 'coreml', 'segnet_gpu': True, 'transformer_gpu': False,
-                'coreml_encoder': True, 'label': 'CoreML（segnet+encoder，decoder 在 CPU）'}
+                'coreml_encoder': encoder_on,
+                'label': ('CoreML（segnet+encoder，decoder 在 CPU）' if encoder_on
+                          else 'CoreML（仅 segnet，encoder/decoder 在 CPU）')}
     if backend == 'cuda':
         return {'name': 'cuda', 'segnet_gpu': True, 'transformer_gpu': True,
                 'coreml_encoder': False, 'label': 'CUDA'}
@@ -488,6 +496,49 @@ def _backend_from_flags(use_gpu_inference: Optional[bool],
             return _resolve_inference_backend('coreml')
         return _resolve_inference_backend('cpu')
     return _resolve_inference_backend('auto')
+
+
+def _install_coreml_compute_units_override() -> None:
+    """Let ``$HOMR_COREML_COMPUTE_UNITS`` override homr's hard-coded choice.
+
+    homr pins the Core ML MLProgram sessions to ``CPUAndGPU`` (it skips the
+    expensive ANE specialization at session-creation time).  Its own comments
+    note that steady-state batches are *slower* that way and that "ALL" wins when
+    the session lives long enough to amortise the warm-up.  Which one is faster
+    here has to be measured, not assumed, so expose the knob instead of forking
+    homr:
+
+        HOMR_COREML_COMPUTE_UNITS=ALL          # ANE + GPU + CPU (homr default is CPUAndGPU)
+        HOMR_COREML_COMPUTE_UNITS=CPUAndGPU
+        HOMR_COREML_COMPUTE_UNITS=CPUOnly
+
+    No-op unless the variable is set; safe to call repeatedly.
+    """
+    wanted = os.environ.get('HOMR_COREML_COMPUTE_UNITS', '').strip()
+    if not wanted:
+        return
+    try:
+        from homr import onnx_providers  # noqa: PLC0415
+    except Exception:
+        return
+    current = getattr(onnx_providers, 'coreml_mlprogram_providers', None)
+    if current is None or getattr(current, '_dsh_override', False):
+        return
+
+    def coreml_mlprogram_providers(model_path: str, compute_units: str = 'ALL'):
+        return current(model_path, compute_units=wanted)
+
+    coreml_mlprogram_providers._dsh_override = True  # type: ignore[attr-defined]
+    onnx_providers.coreml_mlprogram_providers = coreml_mlprogram_providers
+    # inference_segnet / encoder_inference imported the name by value.
+    for module_name in ('homr.segmentation.inference_segnet', 'homr.transformer.encoder_inference'):
+        try:
+            module = __import__(module_name, fromlist=['x'])
+            if hasattr(module, 'coreml_mlprogram_providers'):
+                module.coreml_mlprogram_providers = coreml_mlprogram_providers
+        except Exception:
+            continue
+    log_message(f'[homr] Core ML compute units 覆盖为 {wanted}（$HOMR_COREML_COMPUTE_UNITS）')
 
 
 def _preprocess_for_homr(image_path: Path, work_dir: Path) -> Optional[Path]:
@@ -631,6 +682,7 @@ def _run_homr_multipage_pdf(
     _add_nvidia_cuda_dll_dirs()
     try:
         import homr.main as homr_main  # type: ignore[import-not-found]
+        _install_coreml_compute_units_override()
         _apply_ort_thread_override()  # parallel-batch: cap ONNX threads to this worker's CPU share
         # 与 run_homr_batch 相同：download_weights 只下载缺失权重，弱网下可能长时间挂起。
         # 不能用 ThreadPoolExecutor + result(timeout)（假超时：with 退出阻塞到任务跑完，
@@ -908,6 +960,7 @@ def run_homr_batch(
     _add_nvidia_cuda_dll_dirs()
     try:
         import homr.main as homr_main  # type: ignore[import-not-found]
+        _install_coreml_compute_units_override()
         _apply_ort_thread_override()  # parallel-batch: cap ONNX threads to this worker's CPU share
         # homr.download_weights 只会下载缺失的 ONNX 模型权重。
         # 如果本地已经存在对应 GPU/CPU 模型文件，则不会联网下载。

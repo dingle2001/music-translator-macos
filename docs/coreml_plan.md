@@ -1,6 +1,6 @@
 # Core ML 适配方案与实测结论
 
-- 日期：2026-10-25
+- 日期：2026-10-25（末次更新：默认配置改为 segnet-only 后重测）
 - 机器：Apple Silicon（arm64），macOS 27.0.1
 - 运行时：onnxruntime 1.31.0、homr 0.7.0、Python 3.11.17
 - 原始数据：`docs/bench_coreml.json`（单页）、`docs/bench_coreml_full.json`（5 页）
@@ -9,10 +9,11 @@
 
 ## 1. 结论先行
 
-1. **Core ML 的接线已经完成并可复现**，不是"检测到 provider 就宣布成功"：编译缓存、输出等价性、耗时三项都有证据。
-2. **但在当前组合下它更慢**：整本 5 页 +11%，单页 +140%。因此**默认不用**，`--backend auto` 在 macOS 上解析为 CPU；要试必须显式 `--backend coreml`。
-3. 慢的原因是**结构性**的，不是配置问题：homr 每页都新建 ONNX session，Core ML 的 MLProgram 编译/绑定成本按页重复支付；单页推理本身的收益 < 会话开销。
-4. 因此 Core ML 不应阻塞主链路（符合交接文档 §9 的 DoD 排序）。要继续投入，先做 §5 的三个实验，任意一个能把"每页会话成本"摊掉，才值得继续。
+1. **Apple 加速现在默认开启**（`auto` → Core ML）：产品决策是"开箱即用"，见 `docs/status.md` 决策 D2。
+2. **整本谱有竞争力**：5 页 193 小节，CPU 20.87 s vs Core ML **21.06 s**（差 0.9%，且计算落在 GPU/ANE，CPU 更空闲）。
+3. **单页仍慢**：4.84 s vs 8.34–8.41 s（约 1.7×），因为 Core ML 的会话/绑定固定开销摊不开。`--backend cpu` 因此被明确定义为"短片段/批处理的快路径"。
+4. **默认只加速 segnet**。把 transformer encoder 也放上 Core ML（homr 的 opt-in）会**再慢约 4 s/页**，需要 `HOMR_COREML_ENCODER=1` 显式打开。
+5. **`MLComputeUnits=ALL`（用 ANE）更差**：20.59 s vs 12.54 s（默认 `CPUAndGPU`），ANE 特化预热压垮了小模型。homr 的默认选择是对的。
 
 ---
 
@@ -22,78 +23,95 @@ homr 0.7.0 已内置 Apple 支持（`homr/onnx_providers.py`），且**按模型
 
 | 模型 | 能否上 Core ML | 说明 |
 |---|---|---|
-| segnet | ✅ | fp16 模型；必须 `ModelFormat=MLProgram`，否则几乎不接节点、静默退回 CPU |
-| transformer encoder | ✅（opt-in） | 必须用 fp16 权重；`coreml_encoder=True` |
-| transformer decoder | ❌ | 动态 KV-cache 维度在 MLProgram 下崩溃；固定 CPU fp32（且 CPU fp32 比 CPU fp16 快） |
+| segnet | ✅（默认开） | fp16；必须 `ModelFormat=MLProgram`，否则几乎不接节点、静默退回 CPU |
+| transformer encoder | ✅（opt-in） | 必须 fp16；每行谱表一次调用，短谱上不划算 |
+| transformer decoder | ❌ | 动态 KV-cache 维度在 MLProgram 下崩溃；固定 CPU fp32（且比 CPU fp16 快） |
 
-注意 Core ML EP **不暴露 device memory**，输入输出仍绑定在 CPU（`io_binding_device = "cpu"`），与 CUDA 的 `"cuda"` 不同。
+Core ML EP **不暴露 device memory**：输入输出绑定在 CPU（`io_binding_device = "cpu"`），GPU 只负责计算。这也是小模型收益有限的原因。
 
-所以本仓库的改动只是"把开关接上 + 平台语义正确"，共两处：
+本仓库改动只有"把开关接上 + 平台语义正确"：
 
-- `core/omr/homr_runner.py`：新增 `_resolve_inference_backend()` / `_backend_from_flags()`，把 `auto|cpu|coreml|cuda` 映射为 `(segnet_use_gpu, transformer_use_gpu, coreml_encoder)`；
-- `jianpu.py`：新增 `--backend`，并保留 `--gpu` 旧语义。
+- `core/omr/homr_runner.py`：`_resolve_inference_backend()` / `_backend_from_flags()`，把 `auto|cpu|coreml|cuda` 映射为 `(segnet_use_gpu, transformer_use_gpu, coreml_encoder)`；
+- `--backend` CLI + `$HOMR_BACKEND`；
+- `$HOMR_COREML_COMPUTE_UNITS`：覆盖 homr 硬编码的 `CPUAndGPU`（用于 A/B，不作默认）；
+- `$HOMR_COREML_ENCODER=1`：把 encoder 也移到 Core ML。
 
-关键映射（`coreml`）：`segnet_gpu=True, transformer_gpu=False, coreml_encoder=True`。
-**不能**像 CUDA 那样把 `transformer_use_gpu` 也设为 True——那会让 decoder 走 fp16 + 尝试 Core ML，直接失败。
+**关键**：`transformer_use_gpu` 在 Core ML 下必须保持 `False`。它不是"开加速"的开关，设 True 会让 decoder 走 fp16+CoreML 而崩溃。
 
 ---
 
 ## 3. 实测数据
 
-同一输入、同一机器、每个后端独立子进程（冷启动计入）：
+每个后端独立子进程（冷启动计入），同机同输入。
 
-### 3.1 单页（`曲笛.pdf` 第 1 页）
-
-| 后端 | 第 1 次 | 第 2 次 | 峰值 RSS | 音符 | 与 CPU 差异 |
-|---|---|---|---|---|---|
-| cpu | 5.11 s | 5.09 s | 1211 / 1190 MB | 164 | — |
-| coreml | 13.68 s | 12.23 s | 1273 / 1272 MB | 164 | 0（音高序列逐音相同） |
-
-### 3.2 整本（`曲笛.pdf`，5 页，193 小节）
+### 3.1 整本（`曲笛.pdf`，5 页，193 小节）— 交付默认配置
 
 | 后端 | wall | 峰值 RSS | 音符 | 与 CPU 差异 |
 |---|---|---|---|---|
-| cpu | **21.63 s** | 1695 MB | 804 | — |
-| coreml | **24.16 s** | 1723 MB | 804 | 0（小节/音符/休止/音高序列全等） |
+| cpu | **20.87 s** | 1688 MB | 804 | —（基准） |
+| coreml（segnet only） | **21.06 s** | 1944 MB | 804 | 逐音全等 |
 
-### 3.3 证据：Core ML 确实生效
+> 内存高约 250 MB：Core ML 需要同时保留编译后的 MLProgram 与权重。
 
-- 编译缓存已生成：`homr/segmentation/*_fp16.coreml_cache` 55 MB、`homr/transformer/*_fp16.coreml_cache` 182 MB；
-- 若参数被吞（见 `repo_audit.md` F5），这两个目录**不会**出现——最初正是靠这个反证发现开关没生效的。
+### 3.2 单页（第 1 页，5 行谱表）
 
-### 3.4 解读
+| 后端 | 第 1 次 | 第 2 次 | 峰值 RSS | 音符 |
+|---|---|---|---|---|
+| cpu | 4.84 s | 4.85 s | 1210 / 1191 MB | 164 |
+| coreml（segnet only） | 8.41 s | 8.34 s | 1272 MB | 164 |
 
-- 单页 +8.6 s ≈ 一次 MLProgram 会话建立 + 编译（缓存命中也要加载 240 MB 权重）。
-- 5 页只慢 2.5 s，说明**每页边际成本**已接近 CPU：`(24.16-?)/5` vs `21.63/5 ≈ 4.3 s/页`。
-- 仍然没有正收益：segnet/encoder 的计算量不足以抵消 ANE/GPU 的数据搬运与绑定成本（Core ML EP 的 IO 在 CPU）。
+### 3.3 配置对比（同一页，用于选定默认值）
+
+| 配置 | wall | 结论 |
+|---|---|---|
+| CPU（base） | 4.88 s | 最快 |
+| Core ML：segnet only | **8.61 s** | **Apple 配置里最快 → 选为默认** |
+| Core ML：segnet + encoder | 12.54 s | encoder 上 Core ML 反而多 ~4 s |
+| Core ML：segnet + encoder，`MLComputeUnits=ALL` | 20.59 s | ANE 特化预热代价过大 |
+
+### 3.4 证据：Core ML 确实生效（不是静默回退）
+
+- 编译缓存已生成：`homr/segmentation/*_fp16.coreml_cache` 55 MB；若开启 encoder 另有 182 MB；
+- 若后端参数被 shim 吞掉（曾经的缺陷，见 `repo_audit.md` F5），这两个目录**不会**出现——最初正是靠这个反证发现开关没生效。
+
+### 3.5 怎么读这组数字
+
+- 固定开销 ≈ 3.5 s（会话建立 + MLProgram 装载 + 绑定），所以"页数越多越划算"。
+- 5 页时固定开销已基本摊平，落在噪声范围内；分水岭是**文档长度**，不是单纯页数。
+- 若把"每页重建 segnet session"改成跨页复用，单页延迟有望降到 5–6 s。这是唯一值得再投入的优化，见 §5。
 
 ---
 
-## 4. 可回退性
+## 4. 默认值与回退
 
-- `--backend` 缺省为 `None` → `auto`；macOS 上 `auto` = **CPU**，即"不会因为装了 Core ML 就悄悄变慢"。
-- 显式 `coreml` 但 provider 缺失 → 解析为 `cpu`，并且**日志打印实际后端**（`[homr] 推理后端: CPU …`），不会谎报。
-- 推理期 GPU/CoreML 异常 → 命中 `_is_gpu_err`（已加入 `coreml` 关键字）→ 当页与后续页回退 CPU 重试。
-- 环境变量 `HOMR_BACKEND` 可给 GUI / 批处理统一设默认值。
+| 场景 | 建议 | 原因 |
+|---|---|---|
+| 整本分谱 / 多页 PDF | 默认（`auto` → Core ML） | 与 CPU 持平，但计算在 GPU/ANE，CPU 更空闲 |
+| 单页片段 / 批处理大量短 PDF / CI | `--backend cpu` 或 `HOMR_BACKEND=cpu` | 快 1.7× |
+| 只有 CPU 的环境 | 自动落到 CPU | provider 缺失时降级并**在日志打印实际后端** |
+| 想试 encoder 也上 Core ML | `HOMR_COREML_ENCODER=1` | 已知更慢，仅供实验 |
+
+回退保证：
+- 推理期 Core ML 异常会命中 `_is_gpu_err`（已含 `coreml` 关键字）→ 当页及其后各页回退 CPU 重试；
+- 日志永远打印**实际运行**的后端（`[homr] 推理后端: …`），不把请求值当结果；
+- `auto` 在没有 CoreML 的机器上仍是 CPU。
 
 ---
 
-## 5. 下一步实验（按性价比排序）
+## 5. 唯一值得继续做的实验
 
-1. **跨页复用 session**（最可能翻盘）
-   homr 的 `Segnet`/encoder 在每次 `process_image()` 里重新构造；若在 `homr_runner` 的多页循环里复用同一 session（甚至只复用 Core ML 已编译的 `MLModel`），单页 ~8.6 s 的固定开销会被 193 小节摊平。
-   风险：homr 内部 API 非公开，升级会破；建议以 monkeypatch 形式封装在 `core/omr/` 并加版本守卫。
-2. **`MLComputeUnits` 调参**
-   现在 segnet 用 `CPUAndGPU`（跳过 ANE 特化）。可分别测 `ALL` / `CPUAndGPU` / `CPUOnly`，encoder 也各测一遍；用 `HOMR_COREML_COMPUTE_UNITS` 已可无代码对比。
-3. **换更大页面/更高 DPI 的样本**
-   当前样例是 5 页、每页 5–9 行。若真实乐谱是 300 DPI 扫描件或总谱（每页 20+ 行），segnet 的 patch 数上升，Core ML 才可能跑赢 CPU。**必须用 `scripts/bench_backends.py --pdf <样本>` 复测，不能凭这两份报告外推。**
+**跨页复用 Core ML 会话。** 现状：homr 的 `Segnet` 在每次 `inference()` 里新建（每页 1 次，单页内复用 16 次推理），encoder 是模块级单例。
+已实测 session 创建本身只要 0.2 s，所以省的不是创建时间，而是**每次会话都要重新装载 MLProgram / 绑定 device** 的固定成本。
 
-只有当 1 或 3 出现 **≥1.2× 加速且输出逐音一致** 时，才把 macOS 的 `auto` 改为 coreml。
+做法：在 `core/omr/` 里用一个按 `use_gpu` 键缓存 `Segnet` 的工厂替换模块内名字（不动 homr 源码），并加 homr 版本守卫。
+预期：单页 8.4 s → 5–6 s；整本不变。
+验收：`scripts/bench_backends.py --pdf <样本> --page 1` 单页 ≥1.2× 提升，且 `diffs_vs` 逐音全等。
 
 ---
 
 ## 6. 不建议做的事
 
-- 不要自己写一套 Core ML EP 的 provider 选择逻辑覆盖 homr 的：homr 对 segnet/encoder/decoder 的差异化处理（fp16/fp32、MLProgram、decoder 不上 CoreML）是踩过坑的结论，覆盖会引入难查的崩溃。
-- 不要把 `transformer_use_gpu=True` 当作"开 CoreML"的开关。
-- 不要在 CPU 基线未通过验收的产品版本里默认启用 Core ML。
+- 不要覆盖 homr 对 segnet/encoder/decoder 的差异化处理（fp16/fp32、MLProgram、decoder 不上 CoreML）：那是踩过坑的结论。
+- 不要把 `transformer_use_gpu=True` 当作"开 Core ML"。
+- 不要用 `MLComputeUnits=ALL` 做默认：实测更慢。
+- 不要在 CI/回归里用 Core ML 跑基准：噪声大且依赖 GPU 状态；用 CPU 跑正确性回归。

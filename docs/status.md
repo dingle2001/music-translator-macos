@@ -20,7 +20,7 @@
 | 8 | 对照 PDF 双引擎 | `stamp` 60/60（原尺寸）、`strip` 185/185（加高页面） |
 | 9 | Provider 抽象 `--backend cpu/coreml/cuda/auto` + `HOMR_BACKEND` | `core/omr/homr_runner.py`、`jianpu.py`；`tests/test_inference_backend.py`（9 例） |
 | 10 | 修复 shim 吞掉后端参数（静默跑 CPU） | `_build_processing_config`；`docs/repo_audit.md` F5 |
-| 11 | Core ML 实测 + 结论（更慢，默认关闭） | `docs/coreml_plan.md`、`docs/bench_coreml*.json` |
+| 11 | Core ML 实测 + **默认开启**（segnet-only，整本与 CPU 持平） | `docs/coreml_plan.md`、`docs/bench_coreml*.json` |
 | 12 | 环境自检脚本 | `scripts/check_macos_env.py`（21 项） |
 | 13 | 后端基准脚本 | `scripts/bench_backends.py`（耗时/RSS/逐音 diff） |
 | 14 | 安装与排障文档 | `docs/macos_setup.md` |
@@ -52,11 +52,21 @@
 | 低 | `import fitz` 旧别名（2 处） | PyMuPDF 2.x 仅告警 | 统一 `import pymupdf` |
 | 低 | 模型下载超时 120 s | 弱网首跑必失败 | 已用文档+自检脚本缓解；可改为可配置 |
 | 低 | `main` 分支是另一条产品线 | 长期维护会分叉 | 决定是否合并 Web 版 |
-| 决策 | AGPL 传染 + PyMuPDF 双许可 | 闭源商业发行需替换/购买许可 | 见 `repo_audit.md` §6 |
+| 已定 | **开源发行（AGPL-3.0）** | 决策 D3：接受 AGPL 与 PyMuPDF 的 AGPL 分支；闭源商业路线暂不考虑 | 需随包提供完整源码/构建脚本 |
 
 ---
 
-## 4. 下一步（严格按此顺序）
+## 4. 已定产品决策
+
+| 编号 | 日期 | 决策 | 影响 |
+|---|---|---|---|
+| D1 | 2026-10-25 | 目标平台仅 Apple Silicon（arm64），Intel/Universal 暂不做 | 简化打包与依赖 |
+| D2 | 2026-10-25 | **Apple 加速开箱即用**：macOS 上 `auto` = Core ML（segnet-only） | 整本持平、单页慢 1.7×；`--backend cpu` 作为快路径写进文档 |
+| D3 | 2026-10-25 | **接受开源发行（AGPL-3.0）** | 无需替换 PyMuPDF / SumisoraOMR / Homr；需履行 AGPL 源码提供义务，模型权重许可仍需向作者确认 |
+
+---
+
+## 5. 下一步（严格按此顺序）
 
 1. **补 3 类真实样本的人工校谱记录**（阶段 A 的验收门槛还差这一条）。产出 `docs/proofreading_<样本>.md`：页码 / 小节 / 原谱 / 识别结果 / 判定。
 2. 给 CLI 加 `--strict`，把"备用排版"变成硬失败；顺手把 `import fitz` 清理掉。
@@ -66,7 +76,7 @@
 
 ---
 
-## 5. 复现本文档全部结论的最小命令序列
+## 6. 复现本文档全部结论的最小命令序列
 
 ```bash
 cd music_translator
