@@ -42,9 +42,10 @@ class BackendResolutionTest(unittest.TestCase):
                          'decoder cannot run on the Core ML EP; transformer must stay CPU')
         self.assertTrue(bk['coreml_encoder'])
 
-    def test_auto_prefers_coreml_on_mac(self):
+    def test_auto_is_cpu_on_mac_unless_asked(self):
+        # Measured slower on macOS (docs/coreml_plan.md); acceleration is opt-in.
         with _providers('CPUExecutionProvider', 'CoreMLExecutionProvider'):
-            self.assertEqual(homr_runner._resolve_inference_backend('auto')['name'], 'coreml')
+            self.assertEqual(homr_runner._resolve_inference_backend('auto')['name'], 'cpu')
 
     def test_auto_prefers_cuda_when_present(self):
         with _providers('CPUExecutionProvider', 'CUDAExecutionProvider'):
@@ -70,9 +71,10 @@ class BackendResolutionTest(unittest.TestCase):
                 mock.patch.dict(os.environ, {'HOMR_BACKEND': 'cpu'}):
             self.assertEqual(homr_runner._resolve_inference_backend()['name'], 'cpu')
 
-    def test_legacy_gpu_flag_still_means_cpu_when_off(self):
+    def test_legacy_gpu_flag(self):
         with _providers('CPUExecutionProvider', 'CoreMLExecutionProvider'):
             self.assertEqual(homr_runner._backend_from_flags(False)['name'], 'cpu')
+            # --gpu on means "use the accelerator that exists" -> Core ML on macOS
             self.assertEqual(homr_runner._backend_from_flags(True)['name'], 'coreml')
 
     def test_real_machine_never_raises(self):

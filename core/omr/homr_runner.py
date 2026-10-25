@@ -449,7 +449,12 @@ def _resolve_inference_backend(requested: Optional[str] = None) -> dict:
     has_coreml = 'CoreMLExecutionProvider' in providers
 
     if backend == 'auto':
-        backend = 'cuda' if has_cuda else ('coreml' if has_coreml else 'cpu')
+        # Deliberately *not* Core ML on macOS: measured slower than the CPU EP
+        # (11% on a 5-page vector score, 140% on a single page — see
+        # docs/coreml_plan.md), because homr builds a fresh session per page and
+        # the MLProgram compile/bind cost is paid per session.  Accelerators are
+        # opt-in: --backend coreml / --backend cuda.
+        backend = 'cuda' if has_cuda else 'cpu'
     if backend == 'cuda' and not has_cuda:
         backend = 'cpu'
     if backend == 'coreml' and not has_coreml:
@@ -471,6 +476,16 @@ def _backend_from_flags(use_gpu_inference: Optional[bool],
     if backend:
         return _resolve_inference_backend(backend)
     if use_gpu_inference is False:
+        return _resolve_inference_backend('cpu')
+    if use_gpu_inference is True:
+        # Legacy ``--gpu on`` means "use whatever accelerator exists".  Keep it
+        # working on Apple Silicon by selecting Core ML explicitly, rather than
+        # letting it fall through to the CPU-only ``auto`` default above.
+        providers = _available_providers()
+        if 'CUDAExecutionProvider' in providers or 'DmlExecutionProvider' in providers:
+            return _resolve_inference_backend('cuda')
+        if 'CoreMLExecutionProvider' in providers:
+            return _resolve_inference_backend('coreml')
         return _resolve_inference_backend('cpu')
     return _resolve_inference_backend('auto')
 
