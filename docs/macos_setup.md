@@ -140,7 +140,7 @@ export PATH="$PWD/../.toolchain/lilypond/bin:$PATH"
 python scripts/check_macos_env.py
 ```
 
-期望结尾：`21 项检查：0 失败 / 1 警告`（唯一警告通常是 `waifu2x` 不可用，矢量 PDF 不受影响）。
+期望结尾：`22 项检查：0 失败 / 1 警告`（唯一警告通常是 `waifu2x` 不可用，矢量 PDF 不受影响）。
 任何 `FAIL` 都会在后续步骤变成更难定位的问题，先修。
 
 ---

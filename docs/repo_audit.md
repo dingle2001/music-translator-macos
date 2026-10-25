@@ -92,7 +92,7 @@ macOS arm64 只有 2.26+ 的官方构建；仓库内置的 `scripts/jianpu-ly.py
 1. 无条件输出 `#(define fonts (set-global-fonts …))`（仅当 `/Library/Fonts/Arial Unicode.ttf` 存在时）。2.26 删除了该 Scheme 函数 → `Unbound variable: set-global-fonts`。
 2. 自定义 `two-dots` / `three-dots` 音符符号缺少 `(side-axis . ,Y)` 与 `(script-priority . -200)` → 2.26 报 `no side-axis setting found for grob Script`，随后在 `init.ly` 阶段崩溃。
 
-**最危险的地方**：主渲染器在 LilyPond 失败后会"降级"生成一个**纯文本转储 PDF**（把 `(2 4 #6)` 这样的记号直接印在页面上），并且 **退出码仍是 0**。交接文档 §5 说"不能只看进程退出码"，这里就是实例。
+**最危险的地方**：主渲染器在 LilyPond 失败后会"降级"生成一个**纯文本转储 PDF**（把 `(2 4 #6)` 这样的记号直接印在页面上），并且 **退出码仍是 0**。交接文档 §5 说"不能只看进程退出码"，这里就是实例。该坏样本留在 `../output/evidence_broken_fallback_text_dump.pdf` 作为对照（7 KB、文字层就是记号串），正常产物是 79 KB 的真简谱。
 
 **修复**（`scripts/jianpu-ly.py`，已写入文件头 Apache-2.0 修改声明第 7 条）：
 - 字体块加版本门：`lilypond_minor_version() < 26`；
