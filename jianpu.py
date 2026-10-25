@@ -11,6 +11,8 @@
     python jianpu.py 曲笛.pdf --mode insitu         # 只要原位简谱
     python jianpu.py 曲笛.pdf --mode jianpu -o 曲笛简谱.pdf
     python jianpu.py 曲笛.pdf --mxl 已有.musicxml   # 跳过 OMR，直接排版
+    python jianpu.py 曲笛.pdf --backend cpu        # 强制 CPU/ONNX（macOS 基线）
+    python jianpu.py 曲笛.pdf --backend coreml     # Apple Silicon GPU/ANE（segnet+encoder）
 
 OMR 结果会缓存为 ``<work>/<曲名>.musicxml``，第二次运行不再识别。
 """
@@ -30,7 +32,8 @@ HERE = Path(__file__).resolve().parent
 
 # ── 步骤 1：OMR ──────────────────────────────────────────────────────────────
 
-def omr_to_musicxml(score_pdf: Path, work: Path, use_gpu: Optional[bool] = None) -> Path:
+def omr_to_musicxml(score_pdf: Path, work: Path, use_gpu: Optional[bool] = None,
+                    backend: Optional[str] = None) -> Path:
     """PDF → MusicXML（HOMR 引擎）。已存在则直接复用。"""
     cached = work / f'{score_pdf.stem}.musicxml'
     if cached.is_file() and cached.stat().st_size > 0:
@@ -46,7 +49,7 @@ def omr_to_musicxml(score_pdf: Path, work: Path, use_gpu: Optional[bool] = None)
     out_dir = work / f'{score_pdf.stem}.omr'
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f'[omr] 识别 {score_pdf.name} …')
-    res = run_homr_batch(score_pdf, out_dir, use_gpu_inference=use_gpu)
+    res = run_homr_batch(score_pdf, out_dir, use_gpu_inference=use_gpu, backend=backend)
     if not res:
         raise RuntimeError('OMR 失败，请检查 homr 是否安装、模型权重能否下载')
     mxl = find_first_musicxml_file(Path(res), score_pdf.stem)
@@ -122,7 +125,9 @@ def main(argv: list[str]) -> int:
                     help='OMR 中间结果目录（默认 <输出目录>/work）')
     ap.add_argument('--title', default=None, help='标题（默认取输入文件名）')
     ap.add_argument('--gpu', choices=('auto', 'on', 'off'), default='auto',
-                    help='OMR 是否用 GPU（默认 auto）')
+                    help='OMR 是否用 GPU（默认 auto；保留旧语义，新脚本请用 --backend）')
+    ap.add_argument('--backend', choices=('auto', 'cpu', 'coreml', 'cuda'), default=None,
+                    help='OMR 推理后端：cpu / coreml(Apple Silicon) / cuda / auto（默认）')
     args = ap.parse_args(argv)
 
     score: Path = args.score
@@ -139,7 +144,7 @@ def main(argv: list[str]) -> int:
     work.mkdir(parents=True, exist_ok=True)
 
     use_gpu = {'auto': None, 'on': True, 'off': False}[args.gpu]
-    mxl = args.mxl or omr_to_musicxml(score, work, use_gpu=use_gpu)
+    mxl = args.mxl or omr_to_musicxml(score, work, use_gpu=use_gpu, backend=args.backend)
     title = args.title or score.stem
 
     if args.mode in ('jianpu', 'both'):

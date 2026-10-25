@@ -5,9 +5,12 @@ from music21 import chord as m21chord, note as m21note
 
 from ...config import JianpuNote
 from .primitives import (
+    _ALLOWED_UNITS_DESC,
     _ANACRUSIS_CODE_TO_UNITS,
+    _DURATION_TO_UNITS,
     _QL_TO_ANACRUSIS_CODE,
     clone_jianpu_note,
+    jianpu_note_units,
     jianpu_note_units,
     normalize_jianpu_duration,
     split_duration_chunks,
@@ -72,6 +75,62 @@ def _parse_anacrusis_units(time_signature: str) -> Optional[int]:
         return None
     code = time_signature.split(',', 1)[1].strip()
     return _ANACRUSIS_CODE_TO_UNITS.get(code)
+
+
+def pad_measure_to_bar(notes: list[JianpuNote], bar_units: int) -> list[JianpuNote]:
+    """Guarantee notes sum to exactly *bar_units* in integer 64th-note units.
+
+    Ported verbatim from upstream SumisoraOMR (core/notation/jianpu/measure.py);
+    the bundled snapshot had dropped it while ``insitu/render_insitu.py`` still
+    imported it, which made ``--engine stamp`` fail with ImportError.
+
+    This is the final safety net before the jianpu-ly text is assembled.
+    jianpu-ly.py raises a fatal barcheck error whenever barPos > barLength; using
+    integer unit arithmetic here matches its internal Fraction-based calculation and
+    eliminates the floating-point edge cases that repair_jianpu_measure can miss.
+
+    * Overflow: the note that would cross the barline is replaced by a rest that
+      fills exactly the remaining space (split into allowed chunks if needed).
+    * Underflow: a rest is appended to fill the remaining space.
+    """
+    if bar_units <= 0:
+        return list(notes)
+
+    rest_proto = JianpuNote('0', '', 0, 0, 1.0, 0, None, True)
+    total = 0
+    result: list[JianpuNote] = []
+
+    def _fill_rest(remaining: int) -> None:
+        """Append rest chunk(s) to result until *remaining* units are consumed."""
+        while remaining >= 2:
+            for u, dur in _ALLOWED_UNITS_DESC:
+                if u <= remaining:
+                    result.append(clone_jianpu_note(rest_proto, dur))
+                    remaining -= u
+                    break
+            else:
+                break  # no chunk fits (remaining < 2 units)
+
+    for note in notes:
+        # Use the same arithmetic jianpu-ly itself applies to the token, so the
+        # padded total can never disagree with its internal barPos (the table
+        # lookup this replaces drifted on tuplets/off-grid durations).
+        u = jianpu_note_units(note)
+        if total >= bar_units:
+            break
+        if total + u > bar_units:
+            # This note overflows — replace its tail with rest(s)
+            _fill_rest(bar_units - total)
+            total = bar_units
+            break
+        result.append(note)
+        total += u
+
+    # Pad any underflow with rest(s)
+    if total < bar_units:
+        _fill_rest(bar_units - total)
+
+    return result
 
 
 def _ratio_to_bar_units(ratio: str) -> Optional[int]:

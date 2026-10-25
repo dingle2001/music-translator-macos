@@ -51,7 +51,24 @@ class ShengChordRenderingTest(unittest.TestCase):
                 self.assertEqual(self.jly.chordNotes_markup(token, token, token)[2], lily)
 
     def test_hidden_jianpu_staff_also_hides_ledger_lines(self):
-        self.assertIn("\\override LedgerLineSpanner #'stencil = ##f", self.source)
+        # The generator writes the modern dotted property path since the
+        # LilyPond 2.20+ switch; `#'` is the legacy spelling. Accept both so the
+        # assertion tracks the *behaviour* (ledger lines hidden) rather than one
+        # syntax, while still failing if the override disappears entirely.
+        accepted = (
+            "\\override LedgerLineSpanner.stencil = ##f",
+            "\\override LedgerLineSpanner #'stencil = ##f",
+        )
+        self.assertTrue(
+            any(frag in self.source for frag in accepted),
+            f'LedgerLineSpanner override missing; got:\n{self.source[:400]}')
+
+    def test_articulation_definitions_have_side_axis(self):
+        # LilyPond 2.26 aborts with "no side-axis setting found for grob Script"
+        # unless the custom two-dots/three-dots scripts declare side-axis; the
+        # vendored jianpu-ly was backported from upstream for this.
+        self.assertEqual(self.source.count('(side-axis . ,Y)'), 2)
+        self.assertEqual(self.source.count('(script-priority . -200)'), 2)
 
 
 if __name__ == '__main__':

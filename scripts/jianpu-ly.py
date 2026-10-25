@@ -14,6 +14,9 @@
 #   4. Wording tweak in the Python-version error message.
 #   5. Preserve individual chord pitch octaves and chromatic alterations.
 #   6. Hide ledger lines on the hidden numbered-notation staff.
+#   7. Emit the macOS "Arial Unicode" font workaround only for LilyPond < 2.26;
+#      2.26 removed `set-global-fonts`, which aborted every compile on the only
+#      LilyPond builds available for Apple Silicon (2.26+ arm64). See DSH docs.
 # ---------------------------------------------------------------------------
 
 r"""
@@ -277,7 +280,12 @@ def all_scores_start(inDat):
   % un-comment the next line for a more space-saving header layout:
   % scoreTitleMarkup = \markup { \center-column { \fill-line { \magnify #1.5 { \bold { \fromproperty #'header:dedication } } \magnify #1.5 { \bold { \fromproperty #'header:title } } \fromproperty #'header:composer } \fill-line { \fromproperty #'header:instrument \fromproperty #'header:subtitle \smaller{\fromproperty #'header:subsubtitle } } } }
 """
-    if os.path.exists("/Library/Fonts/Arial Unicode.ttf"): r += r"""
+    # LilyPond 2.26 removed the Scheme helper `set-global-fonts` (it lived in
+    # scm/font.scm and was dropped together with the Guile 3 port).  Emitting
+    # the 2.20-era workaround there aborts the whole compile with
+    # "Unbound variable: set-global-fonts".  macOS arm64 builds only exist for
+    # 2.26+, so gate the block on the version instead of on the font file.
+    if os.path.exists("/Library/Fonts/Arial Unicode.ttf") and lilypond_minor_version() < 26: r += r"""
   % As jianpu-ly was run on a Mac, we include a Mac fonts workaround.
   % The Mac version of Lilypond 2.18 used Arial Unicode MS as a
   % fallback even in the Serif font, but 2.20 drops this in Serif
@@ -306,19 +314,23 @@ def all_scores_start(inDat):
    (list
     `(two-dots
        . (
+           (script-priority . -200)
            (stencil . ,ly:text-interface::print)
            (text . ,#{ \markup \override #'(font-encoding . latin1) \center-align \bold ":" #})
            (padding . 0.20)
            (avoid-slur . inside)
+           (side-axis . ,Y)
            (direction . ,UP)))))
 #(append! default-script-alist
    (list
     `(three-dots
        . (
+           (script-priority . -200)
            (stencil . ,ly:text-interface::print)
            (text . ,#{ \markup \override #'(font-encoding . latin1) \center-align \bold """+'"'+three_dots+'"'+r""" #})
            (padding . 0.30)
            (avoid-slur . inside)
+           (side-axis . ,Y)
            (direction . ,UP)))))
 "two-dots" =
 #(make-articulation 'two-dots)

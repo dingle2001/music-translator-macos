@@ -1,0 +1,56 @@
+{
+  "pdf": "曲笛.pdf",
+  "page": null,
+  "python": "3.11.17",
+  "runs": {
+    "cpu": {
+      "attempts": [
+        {
+          "backend": "cpu",
+          "wall_s": 21.62696533300914,
+          "peak_rss_mb": 1694.921875,
+          "error": null,
+          "run": 1,
+          "musicxml": "/var/folders/5k/76rtlln94zq5lf6mmdgtsngr0000gn/T/bench_backends_t32yiuts/cpu_0/曲笛.musicxml",
+          "measures": 193,
+          "notes": 804,
+          "rests": 64
+        }
+      ],
+      "best_wall_s": 21.62696533300914,
+      "peak_rss_mb": 1694.921875,
+      "notes": 804,
+      "measures": 193
+    },
+    "coreml": {
+      "attempts": [
+        {
+          "backend": "coreml",
+          "wall_s": 24.16368195800169,
+          "peak_rss_mb": 1722.71875,
+          "error": null,
+          "run": 1,
+          "musicxml": "/var/folders/5k/76rtlln94zq5lf6mmdgtsngr0000gn/T/bench_backends_t32yiuts/coreml_0/曲笛.musicxml",
+          "measures": 193,
+          "notes": 804,
+          "rests": 64
+        }
+      ],
+      "best_wall_s": 24.16368195800169,
+      "peak_rss_mb": 1722.71875,
+      "notes": 804,
+      "measures": 193
+    }
+  },
+  "rss_note": "peak RSS of the OMR subprocess only",
+  "diffs_vs": {
+    "coreml": {
+      "measures_delta": 0,
+      "notes_delta": 0,
+      "rests_delta": 0,
+      "pitch_sequence_identical": true,
+      "first_pitch_mismatch_at": null,
+      "first_pitch_mismatch": null
+    }
+  }
+}

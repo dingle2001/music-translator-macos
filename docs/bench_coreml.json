@@ -1,0 +1,78 @@
+{
+  "pdf": "曲笛.pdf",
+  "page": 1,
+  "python": "3.11.17",
+  "runs": {
+    "cpu": {
+      "attempts": [
+        {
+          "backend": "cpu",
+          "wall_s": 5.109371499987901,
+          "peak_rss_mb": 1211.078125,
+          "error": null,
+          "run": 1,
+          "musicxml": "/var/folders/5k/76rtlln94zq5lf6mmdgtsngr0000gn/T/bench_backends_gl94x7k4/cpu_0/homr_input.musicxml",
+          "measures": 46,
+          "notes": 164,
+          "rests": 28
+        },
+        {
+          "backend": "cpu",
+          "wall_s": 5.093524458992761,
+          "peak_rss_mb": 1189.921875,
+          "error": null,
+          "run": 2,
+          "musicxml": "/var/folders/5k/76rtlln94zq5lf6mmdgtsngr0000gn/T/bench_backends_gl94x7k4/cpu_1/homr_input.musicxml",
+          "measures": 46,
+          "notes": 164,
+          "rests": 28
+        }
+      ],
+      "best_wall_s": 5.093524458992761,
+      "peak_rss_mb": 1211.078125,
+      "notes": 164,
+      "measures": 46
+    },
+    "coreml": {
+      "attempts": [
+        {
+          "backend": "coreml",
+          "wall_s": 13.681267250009114,
+          "peak_rss_mb": 1272.9375,
+          "error": null,
+          "run": 1,
+          "musicxml": "/var/folders/5k/76rtlln94zq5lf6mmdgtsngr0000gn/T/bench_backends_gl94x7k4/coreml_0/homr_input.musicxml",
+          "measures": 46,
+          "notes": 164,
+          "rests": 28
+        },
+        {
+          "backend": "coreml",
+          "wall_s": 12.228438541991636,
+          "peak_rss_mb": 1271.828125,
+          "error": null,
+          "run": 2,
+          "musicxml": "/var/folders/5k/76rtlln94zq5lf6mmdgtsngr0000gn/T/bench_backends_gl94x7k4/coreml_1/homr_input.musicxml",
+          "measures": 46,
+          "notes": 164,
+          "rests": 28
+        }
+      ],
+      "best_wall_s": 12.228438541991636,
+      "peak_rss_mb": 1272.9375,
+      "notes": 164,
+      "measures": 46
+    }
+  },
+  "rss_note": "peak RSS of the OMR subprocess only",
+  "diffs_vs": {
+    "coreml": {
+      "measures_delta": 0,
+      "notes_delta": 0,
+      "rests_delta": 0,
+      "pitch_sequence_identical": true,
+      "first_pitch_mismatch_at": null,
+      "first_pitch_mismatch": null
+    }
+  }
+}

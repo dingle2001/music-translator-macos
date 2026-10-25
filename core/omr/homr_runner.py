@@ -58,11 +58,24 @@ def _build_processing_config(homr_main, batch_size: int, **kwargs):
     (``import homr.main as homr_main`` inside the function), which this
     module-level helper cannot see.
     """
+    import dataclasses  # noqa: PLC0415
     import inspect  # noqa: PLC0415
     try:
-        accepted = inspect.signature(homr_main.ProcessingConfig.__init__).parameters
+        signature = inspect.signature(homr_main.ProcessingConfig.__init__).parameters
     except Exception:  # pragma: no cover - homr always importable at call time
-        accepted = {}
+        signature = {}
+    accepted: dict = dict(signature)
+    # homr_shim replaces __init__ with ``(*args, **kwargs)`` to tolerate
+    # fork-only kwargs.  That erases the real parameter names, so signature
+    # introspection would filter *every* kwarg out and silently run with
+    # dataclass defaults (segnet_use_gpu=False, coreml_encoder=False …) — i.e.
+    # `--backend coreml` would report CoreML but compute on the CPU.  The shim
+    # keeps the class a dataclass, so fall back to its field list.
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in signature.values()):
+        try:
+            accepted = {f.name: None for f in dataclasses.fields(homr_main.ProcessingConfig)}
+        except Exception:
+            accepted = {}
     kwargs.setdefault('enable_debug', False)
     kwargs.setdefault('enable_cache', False)
     kwargs.setdefault('write_staff_positions', False)
@@ -383,25 +396,83 @@ def _cuda_dlls_available() -> bool:
 def _log_homr_gpu_mode() -> None:
     """Log the compute device homr will use (informational only)."""
     try:
-        import onnxruntime as _rt  # pyright: ignore[reportMissingImports] — heavy optional dep, not installed in the pyright CI venv
-        _avail = _rt.get_available_providers()
+        _avail = _available_providers()
         if 'CUDAExecutionProvider' in _avail:
             log_message('[homr] GPU: CUDAExecutionProvider 可用。')
         elif 'DmlExecutionProvider' in _avail:
             log_message('[homr] GPU: DirectML（DmlExecutionProvider 可用，将尝试集显/独显加速）。')
+        elif 'CoreMLExecutionProvider' in _avail:
+            log_message('[homr] GPU: CoreMLExecutionProvider 可用（Apple Silicon，segnet+encoder）。')
         else:
-            log_message('[homr] GPU: CUDA / DirectML 不可用，将使用 CPU 推理。')
+            log_message('[homr] GPU: CUDA / DirectML / CoreML 不可用，将使用 CPU 推理。')
     except Exception:
         pass
 
 
 def _homr_gpu_available() -> bool:
-    """Return True when ONNX Runtime exposes CUDA or DirectML."""
+    """Return True when ONNX Runtime exposes CUDA, DirectML or Apple CoreML."""
+    return bool({'CUDAExecutionProvider', 'DmlExecutionProvider',
+                 'CoreMLExecutionProvider'} & _available_providers())
+
+
+# ── 推理后端选择（CUDA / Core ML / CPU）──────────────────────────────────────
+# homr 0.7.0 起内置 Apple Silicon 支持，但两种加速的适用面不同（见
+# homr/onnx_providers.py）：
+#   * segnet：fp16 模型，CoreML EP + MLProgram 可以真正跑在 GPU/ANE 上；
+#   * transformer encoder：需要显式 coreml_encoder=True，且必须用 fp16 权重；
+#   * transformer decoder：CoreML EP 跑不了（动态 KV-cache），始终留在 CPU fp32。
+# 因此 macOS 上「开 CoreML」不能简单等同于「把 transformer_use_gpu 设为 True」。
+BACKEND_CHOICES = ('auto', 'cpu', 'coreml', 'cuda')
+
+
+def _available_providers() -> set[str]:
+    """Available ONNX Runtime execution providers; empty when ORT is absent."""
     try:
-        import onnxruntime as rt  # pyright: ignore[reportMissingImports] — heavy optional dep, not installed in the pyright CI venv
-        return bool({'CUDAExecutionProvider', 'DmlExecutionProvider'} & set(rt.get_available_providers()))
+        import onnxruntime as rt  # pyright: ignore[reportMissingImports] — optional heavy dep
+        return set(rt.get_available_providers())
     except Exception:
-        return False
+        return set()
+
+
+def _resolve_inference_backend(requested: Optional[str] = None) -> dict:
+    """Map a backend name (or $HOMR_BACKEND) to concrete homr flags.
+
+    Returns ``{'name', 'segnet_gpu', 'transformer_gpu', 'coreml_encoder', 'label'}``.
+    An unavailable backend silently degrades to CPU, and the returned ``name``
+    is what actually runs — callers must log/report that, never the request.
+    """
+    backend = (requested or os.environ.get('HOMR_BACKEND') or 'auto').strip().lower()
+    if backend not in BACKEND_CHOICES:
+        backend = 'auto'
+    providers = _available_providers()
+    has_cuda = bool({'CUDAExecutionProvider', 'DmlExecutionProvider'} & providers)
+    has_coreml = 'CoreMLExecutionProvider' in providers
+
+    if backend == 'auto':
+        backend = 'cuda' if has_cuda else ('coreml' if has_coreml else 'cpu')
+    if backend == 'cuda' and not has_cuda:
+        backend = 'cpu'
+    if backend == 'coreml' and not has_coreml:
+        backend = 'cpu'
+
+    if backend == 'coreml':
+        return {'name': 'coreml', 'segnet_gpu': True, 'transformer_gpu': False,
+                'coreml_encoder': True, 'label': 'CoreML（segnet+encoder，decoder 在 CPU）'}
+    if backend == 'cuda':
+        return {'name': 'cuda', 'segnet_gpu': True, 'transformer_gpu': True,
+                'coreml_encoder': False, 'label': 'CUDA'}
+    return {'name': 'cpu', 'segnet_gpu': False, 'transformer_gpu': False,
+            'coreml_encoder': False, 'label': 'CPU'}
+
+
+def _backend_from_flags(use_gpu_inference: Optional[bool],
+                        backend: Optional[str] = None) -> dict:
+    """Resolve flags for the legacy ``use_gpu_inference`` switch plus ``backend``."""
+    if backend:
+        return _resolve_inference_backend(backend)
+    if use_gpu_inference is False:
+        return _resolve_inference_backend('cpu')
+    return _resolve_inference_backend('auto')
 
 
 def _preprocess_for_homr(image_path: Path, work_dir: Path) -> Optional[Path]:
@@ -521,6 +592,7 @@ def _run_homr_multipage_pdf(
     output_dir: Path,
     use_gpu_inference: Optional[bool] = None,
     progress_fn=None,
+    backend: Optional[str] = None,
 ) -> Optional[Path]:
     """Run Homr inference page by page and merge results for multi-page PDF input.
 
@@ -529,8 +601,10 @@ def _run_homr_multipage_pdf(
     total_pages = len(page_png_paths)
     log_message(f'[homr] 多页 PDF，共 {total_pages} 页，逐页识别…')
 
-    if use_gpu_inference is None:
-        use_gpu_inference = _homr_gpu_available()
+    _backend = _backend_from_flags(use_gpu_inference, backend)
+    use_gpu_inference = _backend['segnet_gpu']
+    log_message(f'[homr] 推理后端: {_backend["label"]}'
+                + ('' if _backend['name'] != 'cpu' else '（未检测到可用 GPU/ANE provider）'))
 
     _avail_mb = _get_available_memory_mb()
     _batch_size = _compute_segnet_batch_size(_avail_mb)
@@ -549,11 +623,10 @@ def _run_homr_multipage_pdf(
         log_message('[homr] 检查模型权重…')
         try:
             _run_with_heartbeat(
-                # Windows 无 CoreML；GPU 开关同时作用于 segnet 与 transformer
                 lambda: homr_main.download_weights(
-                    segnet_use_gpu=use_gpu_inference,
-                    transformer_use_gpu=use_gpu_inference,
-                    coreml_encoder=False,
+                    segnet_use_gpu=_backend['segnet_gpu'],
+                    transformer_use_gpu=_backend['transformer_gpu'],
+                    coreml_encoder=_backend['coreml_encoder'],
                 ),
                 label='[homr] 模型权重下载',
                 max_seconds=120,
@@ -624,21 +697,24 @@ def _run_homr_multipage_pdf(
 
             _heartbeat_fn = _make_heartbeat(_pn, _tf, _pfn)
 
-            def _make_config(gpu):
+            def _make_config(bk):
                 return _build_processing_config(
                     homr_main, _batch_size,
-                    transformer_use_gpu=gpu, segnet_use_gpu=gpu,
+                    transformer_use_gpu=bk['transformer_gpu'],
+                    segnet_use_gpu=bk['segnet_gpu'],
+                    coreml_encoder=bk['coreml_encoder'],
                     title_detection=False,
                 )
 
             xml_args = homr_main.XmlGeneratorArguments(False, None, None)
-            mode_label = 'GPU' if _gpu_mode else 'CPU'
+            _page_backend = _backend if _gpu_mode else _resolve_inference_backend('cpu')
+            mode_label = _page_backend['label']
             log_message(f'[homr] 第 {page_num} 页：开始识别（{mode_label} 模式）…')
 
             _captured_image_path = image_path  # 闭包捕获当前页的路径
             _page_ok = False
             try:
-                _cfg = _make_config(_gpu_mode)
+                _cfg = _make_config(_page_backend)
                 _run_with_heartbeat(
                     lambda p=_captured_image_path, c=_cfg, x=xml_args: homr_main.process_image(str(p), c, x),
                     label=f'[homr] 第 {page_num}/{total_pages} 页 ',
@@ -650,15 +726,17 @@ def _run_homr_multipage_pdf(
                 _exc_str = str(exc)
                 _is_gpu_err = _gpu_mode and (
                     'cuda' in _exc_str.lower()
+                    or 'coreml' in _exc_str.lower()
                     or 'CUDAExecutionProvider' in _exc_str
                     or 'DmlExecutionProvider' in _exc_str
+                    or 'CoreMLExecutionProvider' in _exc_str
                     or 'not active after session creation' in _exc_str
                 )
                 if _is_gpu_err:
                     log_message(f'[homr] 第 {page_num} 页 GPU 失败，切换为 CPU 模式（后续页同步切换）…')
                     _gpu_mode = False
                     try:
-                        _cpu_cfg = _make_config(False)
+                        _cpu_cfg = _make_config(_resolve_inference_backend('cpu'))
                         _run_with_heartbeat(
                             lambda p=_captured_image_path, c=_cpu_cfg, x=xml_args: homr_main.process_image(str(p), c, x),
                             label=f'[homr] 第 {page_num}/{total_pages} 页(CPU) ',
@@ -731,6 +809,7 @@ def run_homr_batch(
     output_dir: Path,
     use_gpu_inference: Optional[bool] = None,
     progress_fn=None,
+    backend: Optional[str] = None,
 ) -> Optional[Path]:
     """Run homr on a single image file or a multi-page PDF, returning the output directory.
 
@@ -744,7 +823,8 @@ def run_homr_batch(
             return None
         if len(page_png_paths) > 1:
             return _run_homr_multipage_pdf(
-                source_image, page_png_paths, output_dir, use_gpu_inference, progress_fn
+                source_image, page_png_paths, output_dir, use_gpu_inference,
+                progress_fn, backend=backend,
             )
         # 单页 PDF：沿用原始单图流程
         image_path = page_png_paths[0]
@@ -757,8 +837,9 @@ def run_homr_batch(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if use_gpu_inference is None:
-        use_gpu_inference = _homr_gpu_available()
+    _backend = _backend_from_flags(use_gpu_inference, backend)
+    use_gpu_inference = _backend['segnet_gpu']
+    log_message(f'[homr] 推理后端: {_backend["label"]}')
 
     preprocess_dir = output_dir / '_homr_preprocessed'
     log_message('[homr] 正在进行图像预处理…')
@@ -821,11 +902,10 @@ def run_homr_batch(
         log_message('[homr] 检查模型权重…')
         try:
             _run_with_heartbeat(
-                # Windows 无 CoreML；GPU 开关同时作用于 segnet 与 transformer
                 lambda: homr_main.download_weights(
-                    segnet_use_gpu=use_gpu_inference,
-                    transformer_use_gpu=use_gpu_inference,
-                    coreml_encoder=False,
+                    segnet_use_gpu=_backend['segnet_gpu'],
+                    transformer_use_gpu=_backend['transformer_gpu'],
+                    coreml_encoder=_backend['coreml_encoder'],
                 ),
                 label='[homr] 模型权重下载',
                 max_seconds=120,
@@ -839,12 +919,12 @@ def run_homr_batch(
             return None
         config = _build_processing_config(
             homr_main, _batch_size,
-            transformer_use_gpu=use_gpu_inference,
-            segnet_use_gpu=use_gpu_inference,
+            transformer_use_gpu=_backend['transformer_gpu'],
+            segnet_use_gpu=_backend['segnet_gpu'],
+            coreml_encoder=_backend['coreml_encoder'],
         )
         xml_args = homr_main.XmlGeneratorArguments(False, None, None)
-        mode_label = 'GPU' if use_gpu_inference else 'CPU'
-        log_message(f'[homr] 开始识别（{mode_label} 模式）…')
+        log_message(f'[homr] 开始识别（{_backend["label"]} 模式）…')
         _run_with_heartbeat(
             lambda: homr_main.process_image(str(image_path), config, xml_args),
             label='[homr] ',
@@ -856,8 +936,10 @@ def run_homr_batch(
         # CUDA / GPU 错误（session 创建成功但推理时失败）→ 回退 CPU 重试
         _is_gpu_err = use_gpu_inference and (
             'cuda' in _exc_str.lower()
+            or 'coreml' in _exc_str.lower()
             or 'CUDAExecutionProvider' in _exc_str
             or 'DmlExecutionProvider' in _exc_str
+            or 'CoreMLExecutionProvider' in _exc_str
             or 'not active after session creation' in _exc_str
         )
         if _is_gpu_err:
@@ -866,6 +948,7 @@ def run_homr_batch(
                     homr_main, _batch_size,
                     transformer_use_gpu=False,
                     segnet_use_gpu=False,
+                    coreml_encoder=False,
                 )
                 log_message('[homr] 回退到 CPU 模式重试…')
                 _run_with_heartbeat(

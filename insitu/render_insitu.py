@@ -9,13 +9,16 @@ similar.
 
 How the jianpu-ly source is assembled
 -------------------------------------
-`core.notation.jianpu` renders each measure with `jianpu_note_token` +
-`pad_measure_to_bar`, and emits the ordinary jianpu-ly grammar where a measure is
-a token list and `-` means "hold", `'` raises an octave, `q`/`s`/`d` shorten the
-note.  We reuse those two functions verbatim so the tokens are the reference
-renderer's, and only differ in **how many measures go on one line**: instead of
-the library's fixed 4, we emit one line per engraved staff, with the measures
-distributed exactly as `align.py` sliced them.
+`core.notation.jianpu` renders each measure with `jianpu_note_token`, and emits
+the ordinary jianpu-ly grammar where a measure is a token list and `-` means
+"hold", `'` raises an octave, `q`/`s`/`d` shorten the note.  We reuse that
+function verbatim so the tokens are the reference renderer's, and only differ
+in **how many measures go on one line**: instead of the library's fixed 4, we
+emit one line per engraved staff, with the measures distributed exactly as
+`align.py` sliced them.  Note that the current core deliberately emits notes
+"exactly as extracted: no padding, no trimming" (see
+`build_jianpu_ly_text_from_measures`), so the old ``pad_measure_to_bar`` step
+is gone — it no longer exists in ``core.notation.jianpu``.
 
 Placement
 ---------
@@ -54,8 +57,8 @@ ensure_sumisora()
 from core.notation.jianpu import (  # noqa: E402
     jianpu_note_token,
     pad_measure_to_bar,
-    _parse_bar_units,
     _parse_anacrusis_units,
+    _parse_bar_units,
     extract_jianpu_measures,
     _get_score_key_tonic,
 )
@@ -82,7 +85,15 @@ _LINE_WIDTH_PT = 540
 # ── per-measure tokens ───────────────────────────────────────────────────────
 
 def _measure_texts(measures, time_sig: str) -> list[str]:
-    """Return one jianpu-ly token string per measure, exactly as the library does."""
+    """Return one jianpu-ly token string per measure, exactly as the library does.
+
+    Each in-situ line is compiled as its own LilyPond score, so jianpu-ly's
+    barLength check applies to *that line only*: a measure whose notes do not
+    sum to the signature aborts the whole line with "barcheck fail".  Padding
+    with rests to the exact bar length (the upstream ``pad_measure_to_bar``)
+    is therefore required here even though the full-score renderer can rely on
+    sloppy-bar handling.
+    """
     bar_units = _parse_bar_units(time_sig)
     pickup_units = _parse_anacrusis_units(time_sig)
     out = []
@@ -109,8 +120,8 @@ def _jianpu_ly_source(lines: list[str], key_header: str, time_sig: str, title: s
     if time_sig:
         pass  # dropped: jianpu-ly prints \time <sig> (an Emmentaler "4/4"
               # glyph) on the staff, which is unrelated to jianpu and shows up
-              # below every engraved staff.  Bars stay correct because we pad
-              # every measure to the full signature ourselves.
+              # below every engraved staff.  The bar content is emitted by the
+              # core library as extracted, so no synthetic padding is added.
     head += ['']
     body = [' | '.join(ln) + ' |' for ln in lines if ln]
     return '\n'.join(head + body) + '\n'
