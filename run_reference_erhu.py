@@ -5,7 +5,7 @@ on all 8 pages of 二胡.pdf and combine output into a single PDF.
 import os
 import sys
 import shutil
-import fitz  # PyMuPDF
+import pymupdf as fitz
 from glob import glob
 from PIL import Image
 import matplotlib

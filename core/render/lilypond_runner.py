@@ -31,7 +31,7 @@ from ..utils import (
 def find_lilypond_executable() -> Optional[str]:
     """Locate the LilyPond executable via env vars, bundled runtime, or common install paths."""
     env_path = os.environ.get('LILYPOND_PATH') or os.environ.get('LILYPOND_HOME')
-    candidates: list[str] = []
+    candidates: list[str] = [os.environ.get('LILYPOND', '')]
     if env_path:
         env_base = Path(env_path)
         candidates.extend([
@@ -61,7 +61,7 @@ def find_lilypond_executable() -> Optional[str]:
         if not candidate:
             continue
         candidate_path = Path(candidate)
-        if candidate_path.is_file():
+        if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
             return str(candidate_path)
         found = shutil.which(candidate)
         if found:

@@ -486,16 +486,8 @@ def _backend_from_flags(use_gpu_inference: Optional[bool],
     if use_gpu_inference is False:
         return _resolve_inference_backend('cpu')
     if use_gpu_inference is True:
-        # Legacy ``--gpu on`` means "use whatever accelerator exists".  Keep it
-        # working on Apple Silicon by selecting Core ML explicitly, rather than
-        # letting it fall through to the CPU-only ``auto`` default above.
-        providers = _available_providers()
-        if 'CUDAExecutionProvider' in providers or 'DmlExecutionProvider' in providers:
-            return _resolve_inference_backend('cuda')
-        if 'CoreMLExecutionProvider' in providers:
-            return _resolve_inference_backend('coreml')
-        return _resolve_inference_backend('cpu')
-    return _resolve_inference_backend('auto')
+        return _resolve_inference_backend('auto')
+    return _resolve_inference_backend()
 
 
 def _install_coreml_compute_units_override() -> None:
@@ -547,14 +539,16 @@ def _preprocess_for_homr(image_path: Path, work_dir: Path) -> Optional[Path]:
     不同于通用预处理，跳过激进去噪锐化（UnsharpMask radius=3, percent=300）以避免
     放大 artifacts 导致 Homr SegNet 误识别 staff。
 
-    步骤：白边裁剪 → 旋转校正 → 梯度修正 → 超分辨率（如需）→ 降采样（如需）
+    步骤：白边裁剪 → 旋转校正 → 梯度修正 → 降采样（如需）
+
+    不做超分辨率：本机没有可用的 SR 引擎，放大只会白白多花时间，
+    交给 homr 在原始分辨率上识别即可。
     """
     from ..image.image_preprocess import (
         crop_white_border, detect_and_correct_rotation, correct_gradient,
         fit_image_within_pixel_limit,
-        LOW_RES_PIXEL_THRESHOLD, AUDIVERIS_MAX_PIXELS,
+        AUDIVERIS_MAX_PIXELS,
     )
-    from ..image.sr_upscale import upscale_image
     from PIL import Image
 
     try:
@@ -581,20 +575,7 @@ def _preprocess_for_homr(image_path: Path, work_dir: Path) -> Optional[Path]:
         working.save(intermediate_path)
         current_path = intermediate_path
 
-        # 步骤 4: 超分辨率（如果需要）
-        with Image.open(current_path) as chk:
-            min_dim = min(chk.size)
-        if min_dim < LOW_RES_PIXEL_THRESHOLD:
-            upscaled_path = work_dir / f'sr_{image_path.stem}.png'
-            if upscale_image(current_path, upscaled_path, scale=2):
-                safe_remove_file(current_path)
-                current_path = upscaled_path
-                log_message(
-                    f'  [预处理] 最短边 {min_dim}px < {LOW_RES_PIXEL_THRESHOLD}px，'
-                    '已执行 2× 超分辨率放大。'
-                )
-
-        # 步骤 5: 降采样（如果超过像素上限）
+        # 步骤 4: 降采样（如果超过像素上限）
         rescaled = fit_image_within_pixel_limit(current_path, work_dir, max_pixels=AUDIVERIS_MAX_PIXELS)
         if rescaled is not None:
             safe_remove_file(current_path)
@@ -636,11 +617,20 @@ def _merge_homr_musicxml_pages(page_mxl_files: list[Path], output_path: Path) ->
                 for idx, measure in enumerate(page_part.findall('measure'), start=1):
                     new_m = copy.deepcopy(measure)
                     new_m.set('number', str(offset + idx))
-                    # 跨页处不需要重复的换行/换页标记
-                    for pr in new_m.findall('print'):
-                        if pr.get('new-page'):
-                            pr.attrib.pop('new-page', None)
-                            pr.set('new-system', 'yes')
+                    if idx == 1:
+                        # 一页的起点必然是一个新谱行。Homr 的单页输出经常不给
+                        # 第一小节写 <print>，合并时若不留标记，上一页最后一
+                        # 行会和本页第一行粘成一行；对齐阶段就无从知道页码
+                        # 已经翻过，可能把上一页的小节分配给本页谱表。这里
+                        # 显式补一个换页标记（已有 new-page/new-system 则保留）。
+                        prints = new_m.findall('print')
+                        if not any(pr.get('new-page') or pr.get('new-system')
+                                   for pr in prints):
+                            if prints:
+                                prints[0].set('new-page', 'yes')
+                            else:
+                                new_m.insert(0, _ET.Element('print',
+                                                            {'new-page': 'yes'}))
                     base_part.append(new_m)
                 for idx, measure in enumerate(base_part.findall('measure'), start=1):
                     measure.set('number', str(idx))
@@ -830,8 +820,14 @@ def _run_homr_multipage_pdf(
                             source_pdf, mxl, page_index=page_num - 1,
                             log=log_message,
                         )
-                    except ValueError:
-                        raise
+                    except ValueError as _mr_exc:
+                        # Ambiguous source/OMR alignment must not abort the
+                        # entire score or rewrite the original page MusicXML.
+                        log_message(
+                            f'[homr] 第 {page_num} 页多小节休止对齐不确定，'
+                            f'保留原始识别结果继续处理：{_mr_exc}',
+                            logging.WARNING,
+                        )
                     except Exception as _mr_exc:
                         log_message(
                             f'[homr] 第 {page_num} 页多小节休止折叠异常（不影响输出）：{_mr_exc}',
@@ -856,6 +852,10 @@ def _run_homr_multipage_pdf(
         return None
 
     # ── 合并所有页的 MusicXML ──────────────────────────────────────────────────
+    partial = len(page_mxl_files) != total_pages
+    if partial:
+        log_message(f'[homr] 警告：仅有 {len(page_mxl_files)}/{total_pages} 页识别成功，'
+                    '输出不完整，将不会缓存为完整结果。', logging.WARNING)
     merged_mxl_path = output_dir / f'{source_pdf.stem}.musicxml'
     if len(page_mxl_files) == 1:
         shutil.copy2(str(page_mxl_files[0]), str(merged_mxl_path))
@@ -864,10 +864,16 @@ def _run_homr_multipage_pdf(
         log_message(f'[homr] 正在合并 {len(page_mxl_files)} 页 MusicXML…')
         if not _merge_homr_musicxml_pages(page_mxl_files, merged_mxl_path):
             shutil.copy2(str(page_mxl_files[0]), str(merged_mxl_path))
+            partial = True
             log_message('[homr] 合并失败，降级使用第 1 页结果。', logging.WARNING)
         else:
             log_message(f'[homr] 合并完成: {merged_mxl_path.name}')
 
+    marker = output_dir / '.partial-omr'
+    if partial:
+        marker.write_text('Recognition or page merge was incomplete.\n', encoding='utf-8')
+    else:
+        marker.unlink(missing_ok=True)
     return output_dir
 
 
@@ -910,7 +916,7 @@ def run_homr_batch(
 
     preprocess_dir = output_dir / '_homr_preprocessed'
     log_message('[homr] 正在进行图像预处理…')
-    # Homr 使用温和预处理：几何校正 + 超分 - 激进锐化
+    # Homr 使用温和预处理：几何校正，跳过激进锐化
     # 激进锐化会放大 artifacts 导致 SegNet 误识别（如 416 个虚假小节）
     preprocessed_image = _preprocess_for_homr(image_path, preprocess_dir)
     if preprocessed_image is not None:

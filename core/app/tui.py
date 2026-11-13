@@ -2,7 +2,6 @@
 # 使用 Rich 库实现类 TUI 的菜单跳转效果（状态机模式）
 import logging
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -71,7 +70,7 @@ def _read_single_key() -> str:
                 return ch
         except (OSError, IOError):
             pass  # fall through to input() fallback
-    elif sys.platform != 'win32':
+    elif sys.stdin.isatty():
         try:
             import termios
             import tty
@@ -275,7 +274,7 @@ class TUI:
     def _screen_convert(self) -> None:
         import dataclasses
         from ..config import OMREngine
-        from ..omr.homr_runner import _homr_gpu_available
+        from ..omr.homr_runner import _backend_from_flags
 
         from .pipeline import process_bulk_input_to_jianpu
 
@@ -292,7 +291,7 @@ class TUI:
             '  [bold]1[/bold]  [green]自动（按格式选择）[/green]  [bold green]← 推荐[/bold green]'
         )
         self.console.print(
-            '         [dim]PDF 输入 → Audiveris；图片（PNG/JPG）输入 → Audiveris[/dim]'
+            '         [dim]macOS 默认 Homr；其他平台默认 Audiveris[/dim]'
         )
         self.console.print()
         self.console.print(
@@ -305,8 +304,7 @@ class TUI:
             '         [dim]基于传统启发式算法，不依赖 GPU，任何机器均可运行[/dim]'
         )
         self.console.print()
-        gpu_available = _homr_gpu_available()
-        gpu_info = '已检测到 GPU（DirectML/CUDA）' if gpu_available else 'CPU（未检测到可用 GPU）'
+        gpu_info = _backend_from_flags(None)['label']
         self.console.print(
             '  [bold]3[/bold]  [cyan]Homr[/cyan]  [dim]（手动指定，强制用于所有格式）[/dim]'
         )
@@ -314,11 +312,7 @@ class TUI:
             '         [dim]对拍照乐谱（手机拍摄、光线不均匀、低对比度图像）效果更好[/dim]'
         )
         self.console.print(
-            f'         [dim]识别速度取决于 GPU 性能（当前计算设备：{gpu_info}[/dim]'
-        )
-        self.console.print(
-            '         [dim]GPU 优先级：DirectML (任意 GPU) > CUDA+cuDNN > CPU 回退[/dim]'
-
+            f'         [dim]推理后端：{gpu_info}[/dim]'
         )
         self.console.print()
         self._status_bar('按数字键选择引擎  │  ESC / b = 返回')
@@ -336,8 +330,8 @@ class TUI:
             engine_display = 'Homr（强制）'
         else:
             # '1' 或任意其他键 → 自动按格式选择（默认）
-            selected_engine = OMREngine.AUTO
-            engine_display = '自动（Audiveris）'
+            selected_engine = OMREngine.HOMR if sys.platform == 'darwin' else OMREngine.AUTO
+            engine_display = '自动（Homr）' if sys.platform == 'darwin' else '自动（Audiveris）'
 
         config_with_engine = dataclasses.replace(self.config, omr_engine=selected_engine)
 
@@ -482,8 +476,17 @@ class TUI:
             # Open Notepad and wait for it to close
             notepad_proc: Optional[subprocess.Popen] = None
             try:
-                notepad_proc = subprocess.Popen(['notepad.exe', str(txt_path)])
-            except OSError:
+                if sys.platform == 'darwin':
+                    subprocess.run(['open', '-e', str(txt_path)], check=True)
+                    self._status_bar('在文本编辑中保存文件后，按任意键继续...')
+                    _read_single_key()
+                elif sys.platform == 'win32':
+                    notepad_proc = subprocess.Popen(['notepad.exe', str(txt_path)])
+                else:
+                    _open_file_default(txt_path)
+                    self._status_bar('在编辑器中保存文件后，按任意键继续...')
+                    _read_single_key()
+            except (OSError, subprocess.CalledProcessError):
                 self.console.print('[red]  无法启动记事本，请手动编辑以下文件：[/red]')
                 self.console.print(f'    [dim]{txt_path}[/dim]')
                 self.console.print()
@@ -519,61 +522,27 @@ class TUI:
     def _do_regenerate(self, txt_path: Path, title: str, output_dir: Path) -> None:
         """Regenerate jianpu PDF from an edited .jianpu.txt via jianpu-ly → LilyPond.
 
-        The editor workspace file has a human-readable ``#``-prefixed comment
-        header prepended by ``_build_editor_header()``.  jianpu-ly.py does NOT
-        treat ``#`` as a line comment inside score content — it only skips them
-        inside its own documentation output routine.  We therefore write a
-        temporary copy of the file with all ``#`` comment lines stripped before
-        passing it to ``render_jianpu_ly``.
+        The shared jianpu runner filters the editor's comment header while
+        preserving music lines beginning with sharp accidentals.
         """
-        import tempfile
-        from ..render.renderer import sanitize_generated_lilypond_file
-        from ..render.lilypond_runner import render_jianpu_ly, render_lilypond_pdf
-        from ..utils import safe_remove_file
+        from ..render.renderer import render_edited_jianpu
 
         self._header('简谱编辑器 — 生成中 ...')
         self.console.print()
         self.console.print(f'  正在从校对文件生成简谱 PDF：[cyan]{title}[/cyan]')
         self.console.print()
 
-        ly_path = txt_path.with_suffix('.ly')
         output_dir.mkdir(parents=True, exist_ok=True)
         success = False
-        out_pdf: Optional[Path] = None
-        clean_txt_path: Optional[Path] = None
-
+        out_pdf = output_dir / f'{txt_path.stem}.pdf'
         try:
-            # Strip "# comment" header lines — jianpu-ly parses # as a sharp
-            # accidental token, causing "Unrecognised command # in score" errors.
-            raw = txt_path.read_text(encoding='utf-8', errors='ignore')
-            clean = '\n'.join(
-                line for line in raw.splitlines() if not line.startswith('#')
-            )
-            with tempfile.NamedTemporaryFile(
-                mode='w', encoding='utf-8', suffix='.jianpu.txt',
-                dir=txt_path.parent, delete=False,
-            ) as tmp:
-                tmp.write(clean)
-                clean_txt_path = Path(tmp.name)
-
-            if render_jianpu_ly(clean_txt_path, ly_path):
-                sanitize_generated_lilypond_file(ly_path, title)
-                pdf_result = render_lilypond_pdf(ly_path)
-                if pdf_result is not None and pdf_result.exists():
-                    # Output filename mirrors the main pipeline convention
-                    out_pdf = output_dir / f'{txt_path.stem}.pdf'
-                    shutil.copy(str(pdf_result), str(out_pdf))
-                    success = True
+            success = render_edited_jianpu(txt_path, out_pdf, title)
         except Exception as exc:
             log_message(f'重新生成 PDF 时发生错误: {exc}', logging.WARNING)
-        finally:
-            if clean_txt_path is not None:
-                safe_remove_file(clean_txt_path)
-            safe_remove_file(ly_path)
 
         self._header('简谱编辑器 — 生成结果')
         self.console.print()
-        if success and out_pdf is not None:
+        if success:
             self.console.print('  [bold green]✓ 简谱 PDF 已生成：[/bold green]')
             self.console.print(f'    [dim]{out_pdf}[/dim]')
             try:
@@ -603,7 +572,7 @@ class TUI:
             '  3. 转换结果（简谱 PDF / MIDI）保存在 [cyan]Output[/cyan] 文件夹\n'
             '  4. 如需手动校对，选择「4. 打开简谱编辑器」\n\n'
             '[bold]引擎选择说明[/bold]\n'
-            '  • [green]自动（推荐）[/green] — PDF + 图片（PNG/JPG）→ Audiveris\n'
+            '  • [green]自动（推荐）[/green] — macOS 默认 Homr，其他平台默认 Audiveris\n'
             '  • [cyan]Audiveris[/cyan] — 手动指定，强制用于所有格式\n'
             '    基于规则的传统 OMR 引擎，对高对比度印刷乐谱和 PDF 效果最佳\n'
             '  • [cyan]Homr[/cyan]      — 基于深度学习\n'
@@ -641,3 +610,10 @@ def main_tui(config: Optional[AppConfig] = None) -> None:
     """Launch the Rich TUI state machine. Called from pipeline.main()."""
     tui = TUI(config or AppConfig())
     tui.run()
+
+
+if __name__ == '__main__':
+    from homr_shim import install
+
+    install()
+    main_tui()

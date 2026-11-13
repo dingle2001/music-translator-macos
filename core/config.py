@@ -26,7 +26,7 @@ CJK_FONT_CANDIDATES = [
     ('Microsoft YaHei Bold', r'%SystemRoot%\Fonts\msyhbd.ttc'),
 ]
 
-ALLOWED_JIANPU_DURATIONS = [4.0, 3.0, 2.0, 1.5, 1.0, 0.75, 0.5, 0.375, 0.25, 0.1875, 0.125]
+ALLOWED_JIANPU_DURATIONS = [8.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.5, 1.0, 0.75, 0.5, 0.375, 0.25, 0.1875, 0.125, 0.09375, 0.0625]
 SUPPORTED_INPUT_SUFFIXES = {'.pdf', '.png', '.jpg', '.jpeg'}
 # Audio inputs routed to the piano-transcription engine (audio → MIDI → MusicXML).
 # Only formats decodable by the bundled libsndfile (via soundfile) are accepted:
@@ -43,8 +43,6 @@ DEFAULT_AUDIVERIS_MIN_JAVA_VERSION = 25
 RUNTIME_ASSETS_DIR_NAME = 'package-assets'
 AUDIVERIS_RUNTIME_DIR_NAME = 'audiveris-runtime'
 LILYPOND_RUNTIME_DIR_NAME = 'lilypond-runtime'
-WAIFU2X_RUNTIME_DIR_NAME = 'waifu2x-runtime'
-REALESRGAN_RUNTIME_DIR_NAME = 'realesrgan-runtime'
 OMR_ENGINE_DIR_NAME = 'omr_engine'
 AUDIVERIS_INSTALL_DIR_NAME = 'Audiveris'
 # Version of the Audiveris source pinned by the omr_engine/audiveris submodule.
@@ -63,18 +61,6 @@ AUDIVERIS_MSI_NAMES = [
     'Audiveris.msi',
     'audiveris.msi',
 ]
-
-
-# Super-resolution engine
-class SREngine(Enum):
-    """Available super-resolution upscaling engines.
-
-    WAIFU2X:    waifu2x-ncnn-vulkan; optimised for line-art (current default).
-    REALESRGAN: Real-ESRGAN anime model; generally better quality for sheet music.
-                Prefers realesrgan-ncnn-vulkan binary, falls back to Python script.
-    """
-    WAIFU2X = 'waifu2x'
-    REALESRGAN = 'realesrgan'
 
 
 # OMR engine
@@ -140,3 +126,27 @@ class JianpuNote:
     # 的同时音，每项为 (accidental, symbol, upper_dots, lower_dots, midi)。
     # 简谱渲染为 jianpu-ly 的 “,135” 和弦形式；单音为空元组，行为与旧版完全一致。
     chord_notes: tuple[tuple[str, str, int, int, int], ...] = ()
+    # Grace notes are printed but consume no time in the measure.
+    is_grace: bool = False
+    slur_starts: int = 0
+    slur_stops: int = 0
+    # Only used when one in-situ line continues a slur from/to another line.
+    slur_carry_in: int = 0
+    slur_carry_out: int = 0
+    # Tuplet timing is the actual sounding duration; written_duration controls
+    # the notehead/beams before the tuplet ratio is applied.
+    written_duration: Optional[float] = None
+    tuplet_actual: int = 0
+    tuplet_normal: int = 0
+    tuplet_type: Optional[str] = None
+    tuplet_start: bool = False
+    tuplet_stop: bool = False
+    # Safe, whitelisted LilyPond post-events attached to this exact event.
+    notations: tuple[str, ...] = ()
+    # Exact note-level tie information could not be represented safely.
+    tie_review: str = ''
+    # Matched individual-pitch ties: (index within low-to-high chord, ID).
+    pitch_tie_starts: list[tuple[int, int]] = field(default_factory=list)
+    pitch_tie_stops: list[tuple[int, int]] = field(default_factory=list)
+    pitch_tie_carry_in: list[tuple[int, int]] = field(default_factory=list)
+    pitch_tie_carry_out: list[tuple[int, int]] = field(default_factory=list)

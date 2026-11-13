@@ -241,9 +241,12 @@ def find_audiveris_executable() -> Optional[Path]:
     env_path = os.environ.get('AUDIVERIS_EXE_PATH') or os.environ.get('AUDIVERIS_PATH')
     candidates: list[Path] = []
     if env_path:
-        env_base = Path(env_path)
+        env_base = Path(env_path).expanduser()
         candidates.extend([
             env_base,
+            env_base / 'Contents' / 'MacOS' / 'Audiveris',
+            env_base / 'bin' / 'Audiveris',
+            env_base / 'bin' / 'audiveris',
             env_base / 'audiveris.exe',
             env_base / 'Audiveris.exe',
             env_base / 'audiveris.bat',
@@ -293,11 +296,15 @@ def find_audiveris_executable() -> Optional[Path]:
             source_dir / 'bin' / 'audiveris.exe',
         ])
 
-    for candidate in candidates:
-        if candidate.exists() and candidate.is_file():
-            return candidate
+    if sys.platform == 'darwin':
+        for folder in (Path('/Applications'), Path.home() / 'Applications'):
+            candidates.append(folder / 'Audiveris.app' / 'Contents' / 'MacOS' / 'Audiveris')
 
-    for candidate in ['audiveris.exe', 'Audiveris.bat', 'audiveris.bat', 'audiveris']:
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate.absolute()
+
+    for candidate in ['audiveris.exe', 'Audiveris.bat', 'audiveris.bat', 'audiveris', 'Audiveris']:
         found = shutil.which(candidate)
         if found:
             return Path(found)
@@ -464,6 +471,8 @@ def ensure_audiveris_executable() -> Optional[Path]:
                 if detail:
                     log_message(f'从源码准备 Audiveris 失败: {detail}', logging.WARNING)
 
+    if sys.platform != 'win32':
+        return None
     msi_path = find_audiveris_msi()
     if msi_path is None:
         return None

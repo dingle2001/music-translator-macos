@@ -196,6 +196,7 @@ def asUnicode(l):
     return l.decode('utf-8')
 try: from commands import getoutput
 except: from subprocess import getoutput
+import subprocess
 
 def lilypond_minor_version():
     global _lilypond_minor_version
@@ -205,11 +206,15 @@ def lilypond_minor_version():
     if cmd:
         m=re.match(r".*ond-2\.([1-9][0-9])\.",cmd)
         if m: _lilypond_minor_version = int(m.group(1))
-        else: _lilypond_minor_version = int(getoutput(cmd+" --version").split()[2].split('.')[1])
+        else:
+            version = subprocess.check_output([cmd, '--version']).decode('utf-8', 'replace')
+            _lilypond_minor_version = int(version.split()[2].split('.')[1])
     else: _lilypond_minor_version = 22 # assume 2.22 if we can't figure it out
     return _lilypond_minor_version
 
 def lilypond_command():
+    if os.environ.get('LILYPOND'):
+        return os.environ['LILYPOND']
     if hasattr(shutil,'which'):
         w = shutil.which('lilypond')
         if w: return 'lilypond'
@@ -309,7 +314,7 @@ def all_scores_start(inDat):
     r += "}\n" # end of \paper block
 
     r += r"""
-%% 2-dot and 3-dot articulations
+%% Multi-octave dot articulations
 #(append! default-script-alist
    (list
     `(two-dots
@@ -337,6 +342,27 @@ def all_scores_start(inDat):
 
 "three-dots" =
 #(make-articulation 'three-dots)
+
+#(append! default-script-alist
+   (list
+    `(four-dots
+       . ((stencil . ,ly:text-interface::print)
+          (text . ,#{ \markup \override #'(font-encoding . latin1) \override #'(baseline-skip . 0.6) \center-column { \bold "." \bold "." \bold "." \bold "." } #})
+          (padding . 0.30)
+          (avoid-slur . inside)
+          (side-axis . ,Y)
+          (direction . ,UP)))
+    `(five-dots
+       . ((stencil . ,ly:text-interface::print)
+          (text . ,#{ \markup \override #'(font-encoding . latin1) \override #'(baseline-skip . 0.6) \center-column { \bold "." \bold "." \bold "." \bold "." \bold "." } #})
+          (padding . 0.30)
+          (avoid-slur . inside)
+          (side-axis . ,Y)
+          (direction . ,UP)))))
+"four-dots" =
+#(make-articulation 'four-dots)
+"five-dots" =
+#(make-articulation 'five-dots)
 
 \layout {
   \context {
@@ -386,9 +412,10 @@ note-mod-angka = #(define-music-function (text note) (markup? ly:music?)
 
 #(define (add-grob-definition grob-name grob-entry)
    (set! all-grob-descriptions
-         (cons ((@@ (lily) completize-grob-entry)
-                (cons grob-name grob-entry))
-               all-grob-descriptions)))
+         (sort (cons ((@@ (lily) completize-grob-entry)
+                      (cons grob-name grob-entry))
+                     all-grob-descriptions)
+               alist<?)))
 
 #(define (jianpu-grace-curve-stencil grob)
    (let* ((elts (ly:grob-object grob 'elements))
@@ -417,6 +444,13 @@ note-mod-angka = #(define-music-function (text note) (markup? ly:music?)
      (stencil . ,jianpu-grace-curve-stencil)
      (meta . ((class . Spanner)
               (interfaces . ())))))
+
+\layout {
+  \context {
+    \Global
+    \grobdescriptions #all-grob-descriptions
+  }
+}
 
 #(define jianpu-grace-curve-types
    '(
@@ -753,6 +787,28 @@ def addOctaves(octave1,octave2):
         octave1=octave1[1:]
     return octave2
 
+def lily_octave(octave):
+    """Translate Jianpu octave marks to LilyPond's middle-C reference."""
+    level = len(octave) if "'" in octave else -len(octave)
+    level += 1
+    return "'" * level if level >= 0 else "," * -level
+
+def pitch_tie_marks(ties, index):
+    """LilyPond named slurs attached to an individual displayed pitch."""
+    if not ties or index not in ties:
+        return ""
+    starts, stops, carry_in, carry_out = ties[index]
+    def name(number):
+        letters = ""
+        while number:
+            number, digit = divmod(number - 1, 26)
+            letters = chr(ord('A') + digit) + letters
+        return 'PT' + letters
+    return (r"\repeatTie" * len(carry_in)
+            + "".join(r"\=%s)" % name(n) for n in stops)
+            + "".join(r"\=%s(" % name(n) for n in starts)
+            + r"\laissezVibrer" * len(carry_out))
+
 class NoteheadMarkup:
   def __init__(self,graceType=None):
       self.initOneScore()
@@ -793,12 +849,12 @@ class NoteheadMarkup:
   def wholeBarRestLen(self): return {96:"1.",48:"2.",32:"2",24:"4.",16:"4",12:"8.",8:"8"}.get(self.barLength,"1") # TODO: what if irregular?
   def baseOctaveChange(self,change):
       self.base_octave = addOctaves(change,self.base_octave)
-  def __call__(self,figures,nBeams,dots,octave,accidental,tremolo,word,line):
+  def __call__(self,figures,nBeams,dots,octave,accidental,tremolo,word,line,pitch_ties=None):
     # figures is a chord string of '1'-'7', or 'x' or '0' or '-'
     # nBeams is 0, 1, 2 .. etc (number of beams for this note)
     # dots is "" or "." or ".." etc (extra length)
-    # octave is "", "'", "''", "'''", ",", ",," or ",,,"
-    # accidental is "", "#", "b"
+    # octave contains up to five apostrophes or commas
+    # accidental is "", "#", "b", "##", or "bb"
     # tremolo is "" or ":32"
     # word,line is for error handling
     if len(figures)>1:
@@ -809,7 +865,9 @@ class NoteheadMarkup:
 
     isChord = len(figures)>1
     if isChord:
-        chord_ret,octave,placeholder_chord = chordNotes_markup(re.sub(r'[\\qsdh.]','',word),word,line) # word w/out durations
+        chord_ret,octave,placeholder_chord = chordNotes_markup(
+            re.sub(r'[\\qsdh.]','',word),word,line,
+            pitch_ties if not midi and not western else None) # word w/out durations
         if not midi and not western: placeholder_chord = "c"
     else: # not isChord
         placeholder_chord = placeholders[figures]
@@ -839,14 +897,17 @@ class NoteheadMarkup:
             accidental = self.last_accidental # ditto
     else: # not invisTieLast
         if not isChord: octave=addOctaves(octave,self.base_octave)
-        if not octave in [",,,",",,",",","","'","''","'''"]: scoreError("Can't handle octave "+octave+" in",word,line)
+        if len(octave) > 5 or ("'" in octave and "," in octave):
+            scoreError("Can't handle octave "+octave+" in",word,line)
         self.last_octave = octave
-        self.octavesSeen.append({",,,":-3,",,":-2,",":-1,"":0,"'":1,"''":2,"'''":3}[octave]) # for figuring out the best clef with WithStaff
+        self.octavesSeen.append(len(octave) if "'" in octave else -len(octave)) # for figuring out the best clef with WithStaff
         self.last_tremolo = tremolo
         if isChord: self.current_chord = word
         else: self.current_chord = None
     if not figures=="-": self.last_figures = figures
-    if not isChord and not accidental in ["","#","b"]: scoreError("Can't handle accidental "+accidental+" in",word,line)
+    if not isChord and not accidental in ["","#","b","##","bb"]: scoreError("Can't handle accidental "+accidental+" in",word,line)
+    if not_angka and accidental in ("##", "bb"):
+        scoreError("Double accidentals are not supported in not-angka mode:",word,line)
     self.last_accidental = accidental
 
     ret = ""
@@ -929,10 +990,12 @@ class NoteheadMarkup:
     elif not isChord or figures.startswith("-"): # single note or rest
         if need_space_for_accidental and not not_angka and not (figures.startswith("-") or midi or western): ret += r"\once \tweak Accidental.extra-offset #'(0 . 0.7)"
         ret += placeholder_chord
-        if midi or western or not not_angka: ret += {"":"", "#":"is", "b":"es"}[accidental]
-        if (midi or western) and not placeholder_chord=="r": ret += {"":"'","'":"''","''":"'''","'''":"''''",",":"",",,":",",",,,":",,"}[octave] # so no-mark starts near middle C
+        if midi or western or not not_angka: ret += {"":"", "#":"is", "b":"es", "##":"isis", "bb":"eses"}[accidental]
+        if (midi or western) and not placeholder_chord=="r": ret += lily_octave(octave)
         if add_cautionary_accidental: ret += "!"
     ret += ("%d" % length) + dots
+    if not isChord and not midi and not western and figures not in ('-', '0'):
+        ret += pitch_tie_marks(pitch_ties, 0)
     if self.rplacNextIfStillInBeam: self.rplacNextIfStillInBeam += ("r%d" % length) + dots + '['
     if tremolo:
         if midi or western:
@@ -952,12 +1015,16 @@ class NoteheadMarkup:
           oDict = {",":r"-\tweak #'Y-offset #-1.2 ",
                    ",,":r"-\tweak #'Y-offset #-2 ",
                    ",,,":r"-\tweak #'Y-offset #-2.7 ",
+                   ",,,,":r"-\tweak #'Y-offset #-3.4 ",
+                   ",,,,,":r"-\tweak #'Y-offset #-4.1 ",
                 }
           ret += oDict.get(octave,"")
       elif self.graceType:
           oDict = {",":r"-\tweak #'Y-offset #%.1f " % (grace_height-1-nBeams*0.3),
                    ",,":r"-\tweak #'Y-offset #%.1f " % (grace_height-1.6-nBeams*0.3),
                    ",,,":r"-\tweak #'Y-offset #%.1f " % (grace_height-2-nBeams*0.3),
+                   ",,,,":r"-\tweak #'Y-offset #%.1f " % (grace_height-2.7-nBeams*0.3),
+                   ",,,,,":r"-\tweak #'Y-offset #%.1f " % (grace_height-3.4-nBeams*0.3),
                 }
           ret += oDict.get(octave,"")
       # Ugly fix for grace dot positions
@@ -967,13 +1034,19 @@ class NoteheadMarkup:
             "'":"^.",
             "''":r"-\tweak #'X-offset #%.1f ^\two-dots " % x_offset,
             "'''":r"-\tweak #'X-offset #%.1f ^\three-dots " % x_offset,
+            "''''":r"-\tweak #'X-offset #%.1f ^\four-dots " % x_offset,
+            "'''''":r"-\tweak #'X-offset #%.1f ^\five-dots " % x_offset,
             ",":r"-\tweak #'X-offset #%.1f _. " % x_offset,
             ",,":r"-\tweak #'X-offset #%.1f _\two-dots " % x_offset,
-            ",,,":r"-\tweak #'X-offset #%.1f _\three-dots " % x_offset}
+            ",,,":r"-\tweak #'X-offset #%.1f _\three-dots " % x_offset,
+            ",,,,":r"-\tweak #'X-offset #%.1f _\four-dots " % x_offset,
+            ",,,,,":r"-\tweak #'X-offset #%.1f _\five-dots " % x_offset}
       if not_angka: oDict.update({
               "'":r"-\tweak #'extra-offset #'(0.4 . 2.7) -\markup{\bold .}",
               "''":r"-\tweak #'extra-offset #'(0.4 . 3.5) -\markup{\bold :}",
               "'''":r"-\tweak #'extra-offset #'(0.4 . 4.3) -\markup{\bold "+three_dots+"}",
+              "''''":r"-\tweak #'extra-offset #'(0.4 . 5.1) ^\four-dots ",
+              "'''''":r"-\tweak #'extra-offset #'(0.4 . 5.9) ^\five-dots ",
               })
       ret += oDict[octave]
     if nBeams and (not self.inBeamGroup or (self.inBeamGroup=="restHack" and not replaceLast) or inRestHack) and not midi and not western:
@@ -995,7 +1068,14 @@ class NoteheadMarkup:
         else:
             ret = r" \jianpuGraceCurveEnd " + ret
     # sys.stderr.write(accidental+figure+octave+dots+"/"+str(nBeams)+"->"+str(self.barPos)+" ") # if need to see where we are
-    if self.barPos > self.barLength: errExit("(notesHad=%s) barcheck fail: note crosses barline at \"%s\" with %d beams (%d skipped from %d to %d, bypassing %d), scoreNo=%d barNo=%d (but the error could be earlier)" % (' '.join(self.notesHad),figures,nBeams,toAdd,self.barPos-toAdd,self.barPos,self.barLength,scoreNo,self.barNo))
+    if self.barPos > self.barLength:
+        if os.environ.get("j2ly_sloppy_bars",""):
+            # Over-filled measure: the OMR run recognised more notes than the
+            # metre, and the user's decision is to pass it through anyway
+            # ("即便超时值了，也输出") instead of dropping the whole line.
+            # Absorb the overflow here so the next measure still starts clean.
+            sys.stderr.write("Over-filled bar %d ignored (j2ly_sloppy_bars set): %d units over barLength %d\n" % (self.barNo, self.barPos - self.barLength, self.barLength))
+        else: errExit("(notesHad=%s) barcheck fail: note crosses barline at \"%s\" with %d beams (%d skipped from %d to %d, bypassing %d), scoreNo=%d barNo=%d (but the error could be earlier)" % (' '.join(self.notesHad),figures,nBeams,toAdd,self.barPos-toAdd,self.barPos,self.barLength,scoreNo,self.barNo))
     if (self.barPos%self.beatLength == 0 or self.barPos==self.barLength) and self.inBeamGroup: # (or added for irregular time signatures; self.inBeamGroup is set only if not midi/western)
         # jianpu printouts tend to restart beams every beat
         # (but if there are no beams running anyway, it occasionally helps typesetting to keep the logical group running, e.g. to work around bugs involving beaming a dash-and-rest beat in 6/8) (TODO: what if there's a dash-and-rest BAR?  [..]-notated beams don't usually work across barlines
@@ -1006,8 +1086,8 @@ class NoteheadMarkup:
         self.inBeamGroup = "restHack"
     self.lastNBeams = nBeams
     beamC = u'\u0333' if nBeams>=2 else u'\u0332' if nBeams==1 else u""
-    self.unicode_approx.append({'#':u"\u266f",'b':u"\u266d"}.get(0 if invisTieLast else accidental,u"")+(u"-" if invisTieLast else figures[-1:])+beamC+(u"" if invisTieLast else (u'\u0323' if "," in octave else u'\u0307' if "'" in octave else u""))+u''.join(c+beamC for c in dots)+(u"" if self.inBeamGroup else u" ")) # (NB inBeamGroup is correct only if not midi and not western)
-    if self.barPos == self.barLength:
+    self.unicode_approx.append({'#':u"\u266f",'b':u"\u266d",'##':u"\U0001d12a",'bb':u"\U0001d12b"}.get(0 if invisTieLast else accidental,u"")+(u"-" if invisTieLast else figures[-1:])+beamC+(u"" if invisTieLast else (u'\u0323' if "," in octave else u'\u0307' if "'" in octave else u""))+u''.join(c+beamC for c in dots)+(u"" if self.inBeamGroup else u" ")) # (NB inBeamGroup is correct only if not midi and not western)
+    if self.barPos >= self.barLength:
         self.unicode_approx[-1]=self.unicode_approx[-1].rstrip()+u'\u2502'
         self.barPos = 0 ; self.barNo += 1
         self.current_accidentals = {}
@@ -1361,7 +1441,7 @@ def fix_fullwidth(t):
     if type(u"")==type(""): return utext
     else: return utext.encode('utf-8')
 
-def graceNotes_markup(notes,word,line,isAfter,harmonic=False):
+def graceNotes_markup(notes,word,line,isAfter,harmonic=False,marks_by_index=None):
     if lilypond_minor_version()<22: errExit("grace notes requires Lilypond 2.22+, we found 2."+str(lilypond_minor_version()))
     thinspace = u'\u2009'
     if not type("")==type(u""): thinspace = thinspace.encode('utf-8')
@@ -1383,30 +1463,32 @@ def graceNotes_markup(notes,word,line,isAfter,harmonic=False):
     figure = ""
     octave = ""
     mr = []
+    note_index = 0
     if isAfter: mr.append(r"\once \override Score.JianpuGraceCurve.direction = #LEFT ")
     mr.append(r"\jianpuGraceCurveStart ")
     for i in xrange(len(notes)):
         n = notes[i]
         if n=='#':
-            accidental = "#"
+            accidental += "#"
         elif n=='b':
-            accidental = "b"
+            accidental += "b"
         elif n=="'":
             if i and notes[i-1]==notes[i]: continue
-            if notes[i:i+3]=="'''": octave = "'''"
-            elif notes[i:i+2]=="''": octave = "''"
-            else: octave = "'"
+            octave = "'" * len(re.match(r"'+", notes[i:]).group())
+            if len(octave) > 5: scoreError("Can't handle octave "+octave+" in",word,line)
         elif n==',':
             if i and notes[i-1]==notes[i]: continue
-            if notes[i:i+3]==",,,": octave = ",,,"
-            elif notes[i:i+2]==",,": octave = ",,"
-            else: octave = ","
+            octave = "," * len(re.match(r",+", notes[i:]).group())
+            if len(octave) > 5: scoreError("Can't handle octave "+octave+" in",word,line)
         elif n in 'qsdh': beams = '*qsdh'.index(n)
         else:
             # number should be the last char of a note
             figure = n
             mr.append(notemark(figure, beams, "", octave, accidental, "", "", "")[5])
             if harmonic: mr[-1]+=r" \flageolet " # deal with harmonic articulations
+            if marks_by_index and note_index in marks_by_index:
+                mr[-1] += ' ' + ' '.join(marks_by_index[note_index]) + ' '
+            note_index += 1
             accidental = ""
             beams = 2 # reset after each note
             figure = ""
@@ -1416,6 +1498,10 @@ def grace_octave_fix(notes,word,line):
     """Ensures octaves, durations and accidentals come before the
     main notes, not after.  For octaves we check ambiguous cases
     and insist on OctavesBefore or OctavesAfter being set if so"""
+    if notehead_markup.octavesPosition == "after":
+        # Accidentals and durations belong to the following digit even when
+        # the preceding digit has an octave mark (e.g. #1'b3'5').
+        return re.sub(r"([0-9])([',]+)", r"\2\1", notes).replace("8","'1").replace("9","'2")
     def gof_inner(notes): return re.sub(
             "^(.*)([1-9])([^1-9]+)$",
             lambda m:gof_inner(m.group(1))+chr(0)+m.group(3)+m.group(2),notes) # the chr(0) is a temporary marker for below
@@ -1424,43 +1510,73 @@ def grace_octave_fix(notes,word,line):
     L=n2.split(chr(0))
     ambiguous_part = find_ambiguous_octaves(L[0])
     if re.search("[,']",ambiguous_part):
-        if notehead_markup.octavesPosition=="after":
-            ap2=re.sub(r"([1-9][^1-9,']*)([,']+)",r'\2\1',ambiguous_part) # after to before (no recursion needed)
-            L[0]=L[0][:len(L[0])-len(ambiguous_part)]+ap2
-            n2="".join(L)
-        elif not notehead_markup.octavesPosition:
+        if not notehead_markup.octavesPosition:
             msg="Ambiguous octave marks (please set OctavesBefore or OctavesAfter if writing them in the middle)"
             if not ambiguous_part==notes: msg += " in the "+ambiguous_part+" part of"
             else: msg += ":"
             scoreError(msg,word,line)
     return n2.replace(chr(0),"").replace("8","'1").replace("9","'2")
-def gracenotes_western(notes,word,line):
+def gracenotes_western(notes,word,line,marks_by_index=None):
     # for western and MIDI staffs
     notes = grace_octave_fix(notes,word,line)
     nextAcc = "" ; next8ve = "'"
     r = []
     duration = 16
+    note_index = 0
     for i in xrange(len(notes)):
         n = notes[i]
-        if n=='#': nextAcc = "is"
-        elif n=='b': nextAcc = "es"
+        if n=='#': nextAcc += "#"
+        elif n=='b': nextAcc += "b"
         elif n=="'":
             if i and notes[i-1]==notes[i]: continue
-            if notes[i:i+3]=="'''": next8ve = "''''"
-            elif notes[i:i+2]=="''": next8ve = "'''"
-            else: next8ve = "''"
+            octave = re.match(r"'+", notes[i:]).group()
+            if len(octave) > 5: scoreError("Can't handle octave "+octave+" in",word,line)
+            next8ve = lily_octave(octave)
         elif n==',':
             if i and notes[i-1]==notes[i]: continue
-            if notes[i:i+3]==",,,": next8ve = ",,"
-            elif notes[i:i+2]==",,": next8ve = ","
-            else: next8ve = ""
+            octave = re.match(r",+", notes[i:]).group()
+            if len(octave) > 5: scoreError("Can't handle octave "+octave+" in",word,line)
+            next8ve = lily_octave(octave)
         elif n in 'qsdh': duration = {'q':8, 's':16, 'd':32, 'h':64}[n]
         else:
             if not n in placeholders: continue # TODO: errExit ?
-            r.append(placeholders[n]+nextAcc+next8ve+str(duration))
+            if nextAcc not in ("", "#", "b", "##", "bb"):
+                scoreError("Can't handle accidental "+nextAcc+" in",word,line)
+            r.append(placeholders[n]+{"":"", "#":"is", "b":"es", "##":"isis", "bb":"eses"}[nextAcc]+next8ve+str(duration))
+            if marks_by_index and note_index in marks_by_index:
+                r[-1] += ' ' + ' '.join(marks_by_index[note_index])
+            note_index += 1
             nextAcc = "" ; next8ve = "'"
     return ' '.join(r)
-def chordNotes_markup(notes,word,line):
+
+
+_GRACE_MARK_NAMES = ('accent', 'marcato', 'staccato', 'staccatissimo', 'tenuto',
+                     'fermata', 'shortfermata', 'longfermata', 'trill', 'mordent',
+                     'prall', 'turn', 'reverseturn')
+
+
+def merge_marked_grace_groups(line):
+    """Keep consecutive grace notes in one group while retaining per-note marks."""
+    grace = r"g\[[#b',1-9qsdh]+\]"
+    mark = r"GraceMark:[\^_]?\\(?:" + '|'.join(sorted(_GRACE_MARK_NAMES, key=len, reverse=True)) + r")(?![A-Za-z])"
+    pattern = r'(?<!\S)(?:' + grace + r'(?:\s+' + mark + r')*\s+)+' + grace + r'(?:\s+' + mark + r')*(?=\s|$)'
+    def merge(match):
+        parts = re.findall(grace + '|' + mark, match.group(0))
+        notes, marks, index = [], {}, -1
+        for part in parts:
+            if part.startswith('g['):
+                content = part[2:-1]
+                notes.append(content)
+                index += sum(char in '123456789' for char in content)
+            else:
+                value = part[len('GraceMark:'):].replace('\\', '')
+                marks.setdefault(index, []).append(value)
+        if not marks:
+            return match.group(0)
+        spec = ';'.join(str(i) + '=' + ','.join(values) for i, values in sorted(marks.items()))
+        return 'g[' + ''.join(notes) + ']@' + spec
+    return re.sub(pattern, merge, line)
+def chordNotes_markup(notes,word,line,pitch_ties=None):
     notes = grace_octave_fix(notes,word,line) # ensures octaves and accidentals come before notes
     accidental = ""
     figure = ""
@@ -1472,44 +1588,35 @@ def chordNotes_markup(notes,word,line):
     for i in xrange(len(notes)):
         n = notes[i]
         if n=='#':
-            accidental = "#"
+            accidental += "#"
             sortKey += 0.5
         elif n=='b':
-            accidental = "b"
+            accidental += "b"
             sortKey -= 0.5
         elif n=="'":
             if i and notes[i-1]==notes[i]: continue
-            if notes[i:i+3]=="'''":
-                octave = "'''"
-                sortKey += 22
-            elif notes[i:i+2]=="''":
-                octave = "''"
-                sortKey += 15
-            else:
-                octave = "'"
-                sortKey += 8
+            octave = re.match(r"'+", notes[i:]).group()
+            if len(octave) > 5: scoreError("Can't handle octave "+octave+" in",word,line)
+            sortKey += 7 * len(octave) + 1
         elif n==',':
             if i and notes[i-1]==notes[i]: continue
-            if notes[i:i+3]==",,,":
-                octave = ",,,"
-                sortKey -= 22
-            elif notes[i:i+2]==",,":
-                octave = ",,"
-                sortKey -= 15
-            else:
-                octave = ","
-                sortKey -= 8
+            octave = re.match(r",+", notes[i:]).group()
+            if len(octave) > 5: scoreError("Can't handle octave "+octave+" in",word,line)
+            sortKey -= 7 * len(octave) + 1
         else:
             # number should be the last char of a note
             if n not in '01234567' : continue
             figure = n
+            if accidental not in ("", "#", "b", "##", "bb"):
+                scoreError("Can't handle accidental "+accidental+" in",word,line)
             if int(n) == 0: sortKey = 0
             else: sortKey += int(n)
             dNotes.append({
                 'sortKey':sortKey,
                 'figure':figure,
                 'octave':octave,
-                'accidental':accidental})
+                'accidental':accidental,
+                'input_index':len(dNotes)})
             accidental = ""
             figure = ""
             octave = ""
@@ -1517,7 +1624,7 @@ def chordNotes_markup(notes,word,line):
     if sort_chords: dNotes.sort(key=lambda element:element['sortKey'])
     placeholder_chord= "< "
     for f in dNotes:
-        placeholder_chord += placeholders[f['figure']]+{"":"", "#":"is", "b":"es"}[f['accidental']]
+        placeholder_chord += placeholders[f['figure']]+{"":"", "#":"is", "b":"es", "##":"isis", "bb":"eses"}[f['accidental']]
         if "," in f['octave']: placeholder_chord += f['octave'][:-1]+" "
         else: placeholder_chord += f['octave']+"' "
     placeholder_chord += ">"
@@ -1533,16 +1640,24 @@ def chordNotes_markup(notes,word,line):
     offsets = {"'":1,
         "''":1.6,
         "'''":2.2,
+        "''''":2.8,
+        "'''''":3.4,
         ",":1,
         ",,":1.6,
-        ",,,":2.2}
+        ",,,":2.2,
+        ",,,,":2.8,
+        ",,,,,":3.4}
     oDict = {"":"",
         "'":"^.",
         "''":r"-\tweak #'X-offset #0.6 ^\two-dots ",
         "'''":r"-\tweak #'X-offset #0.6 ^\three-dots ",
+        "''''":r"-\tweak #'X-offset #0.6 ^\four-dots ",
+        "'''''":r"-\tweak #'X-offset #0.6 ^\five-dots ",
         ",":r"-\tweak #'X-offset #0.6 _. ",
         ",,":r"-\tweak #'X-offset #0.6 _\two-dots ",
-        ",,,":r"-\tweak #'X-offset #0.6 _\three-dots "}
+        ",,,":r"-\tweak #'X-offset #0.6 _\three-dots ",
+        ",,,,":r"-\tweak #'X-offset #0.6 _\four-dots ",
+        ",,,,,":r"-\tweak #'X-offset #0.6 _\five-dots "}
     ret = "< "
     baseline = 0
     for f in dNotes:
@@ -1550,9 +1665,10 @@ def chordNotes_markup(notes,word,line):
         if ',' in f['octave']: baseline += offsets[f['octave']]
         if baseline > 0:
             ret += r"\tweak #'Y-offset #%.1f " % baseline
-        ret += (r'\note-mod-angka "' if not_angka else r'\note-mod "')+f['figure']+'" '+placeholders[f['figure']]+{"":"", "#":"is", "b":"es"}[f['accidental']]
-        if "," in f['octave']: ret += f['octave'][:-1]+" "
-        else: ret += f['octave']+"' "
+        ret += (r'\note-mod-angka "' if not_angka else r'\note-mod "')+f['figure']+'" '+placeholders[f['figure']]+{"":"", "#":"is", "b":"es", "##":"isis", "bb":"eses"}[f['accidental']]
+        if "," in f['octave']: ret += f['octave'][:-1]
+        else: ret += f['octave']+"'"
+        ret += pitch_tie_marks(pitch_ties, f['input_index']) + " "
         if "," in f['octave']: ret += r"\tweak #'Y-offset #%.1f " % (baseline -0.1 - 1.2 * offsets[f['octave']])
         elif "'" in f['octave']: ret += r"\tweak #'Y-offset #%.1f " % (baseline + 1.6 + 0.02 * offsets[f['octave']])
         ret += oDict[f['octave']]+" "
@@ -1653,7 +1769,8 @@ def getLY(score,headers=None,have_final_barline=True):
         # First, merge multiple grace notes.  This is needed for the
         # output of some MusicXML conversions, and might be useful to
         # have around anyway:
-        line=re.sub(r"(?<=\s)(g\[[#b',1-9qsdh]+\]\s*)+g\[([#b',1-9qsdh]+)\](?=\s)",lambda m:re.sub(r"\]\s*g\[","",m.group()),line)
+        line=merge_marked_grace_groups(line)
+        line=re.sub(r"(?<!\S)(g\[[#b',1-9qsdh]+\]\s*)+g\[([#b',1-9qsdh]+)\](?=\s|$)",lambda m:re.sub(r"\]\s*g\[","",m.group()),line)
         # To support multi-word text above/below the stave, we'll
         # replace space with chr(0) inside quoted strings so they
         # end up being one word per item (we'll put it back to space
@@ -1685,6 +1802,11 @@ def getLY(score,headers=None,have_final_barline=True):
                 isInHarmonic = True
             elif word==":Harm":
                 isInHarmonic = False
+            # Zero-duration chords anchor source MusicXML wedge boundaries at
+            # the current musical time, including an ending barline.
+            elif word in ('WedgeCrescendo', 'WedgeDiminuendo', 'WedgeStop'):
+                out.append({'WedgeCrescendo': r'<> \<', 'WedgeDiminuendo': r'<> \>',
+                            'WedgeStop': r'<> \!'}[word])
             elif re.match("[1-468]+[.]*=[1-9][0-9]*$",word): out.append(r'\tempo '+word) # TODO: reduce size a little?
             elif re.match("[16]=[A-Ga-g][#b]?$",word): #key
                 # Must use \transpose because \transposition doesn't always work.
@@ -1730,6 +1852,18 @@ def getLY(score,headers=None,have_final_barline=True):
             elif re.match(r"R\*[1-9][0-9]*$",word):
                 if not western: out.append(r"\set Score.skipBars = ##t \override MultiMeasureRest #'expand-limit = #1 ") # \compressFullBarRests on Lilypond 2.20, \compressEmptyMeasures on 2.22, both map to \set Score.skipBars
                 out.append(r"R"+notehead_markup.wholeBarRestLen()+word[1:])
+            elif re.fullmatch(r'LayoutBar:[1-9][0-9]*/[1-9][0-9]*', word):
+                # Synthetic bar length for an incomplete or irregular tuplet.
+                # Set the exact LilyPond moment while hiding the layout meter.
+                units = F(word.split(':', 1)[1])
+                moment = units / 64
+                if lilypond_minor_version() >= 26:
+                    length = '#%d/%d' % (moment.numerator, moment.denominator)
+                else:
+                    length = '#(ly:make-moment %d %d)' % (moment.numerator, moment.denominator)
+                out.append(r'\time 4/4 \set Timing.measureLength = ' + length)
+                notehead_markup.setTime(4, 4)
+                notehead_markup.barLength = units
             elif re.match("[1-9][0-9]*/[1-468]+(,[1-9][0-9]*[.]?)?$",word): # time signature
                 if ',' in word: # anacrusis
                     word,anac = word.split(",",1)
@@ -1805,6 +1939,13 @@ def getLY(score,headers=None,have_final_barline=True):
                 notehead_markup.barPos = oldBarPos
                 repeatStack.append((numBraces,oldBarPos,extraRepeats+1,rStartP))
                 out[rStartP] = out[rStartP].replace(('volta %d ' % (extraRepeats+1)),('volta %d ' % (extraRepeats+2))) # ensure there's enough repeats for the alternatives
+            elif word.startswith('GraceMark:'):
+                mark = word[len('GraceMark:'):]
+                if not re.match(r"^[\^_]?\\(?:accent|marcato|staccato|staccatissimo|tenuto|fermata|shortfermata|longfermata|trill|mordent|prall|turn|reverseturn)$", mark):
+                    scoreError("Unsupported grace-note mark",word,line)
+                if not out or not out[-1].startswith(r'\grace { ') or not out[-1].endswith(' }'):
+                    scoreError("Grace-note mark has no preceding grace note",word,line)
+                out[-1] = out[-1][:-2] + ' ' + mark + ' }'
             elif word.startswith("\\") or word.startswith('^\\') or word.startswith('_\\') or word in ["(",")","~","->","|"] or word.startswith('^"') or word.startswith('_"'):
                 # Lilypond command, \p, ^"text", barline check (undocumented, see above), etc
                 if re.match(r"\\[.,'cqsdh\\#b]*[0-9x-][0-9x.,'cqsdh\\#b-]*$",word): sys.stderr.write("Warning: '"+word+"' is being interpreted as a Lilypond command.\nIf you meant it as a note, move the \\ away from the start.\n")
@@ -1818,21 +1959,41 @@ def getLY(score,headers=None,have_final_barline=True):
                 else:
                     out.append(word)
                     if word=="~" and not midi and not western and lastNonDashPtr < lastPtr: sys.stderr.write("Warning: jianpu long-note tie won't be done right because your Lilypond version is older than 2.20\n")
-            elif re.match(r"[1-9][0-9]*\[$",word):
-                # tuplet start, e.g. 3[
-                fitIn = int(word[:-1])
+            elif re.match(r"[1-9][0-9]*(?::[1-9][0-9]*)?\[$",word):
+                # 3[ uses the traditional default; 3:1[ specifies the ratio.
+                spec = word[:-1].split(':')
+                fitIn = int(spec[0])
                 i=2
                 while i<fitIn: i*=2
-                if i==fitIn: num=int(fitIn*3/2)
+                if len(spec) == 2: num = int(spec[1])
+                elif i==fitIn: num=int(fitIn*3/2)
                 else: num=int(i/2)
                 out.append("\\times %d/%d {" % (num,fitIn))
                 notehead_markup.tuplet = (num,fitIn)
             elif word==']': # tuplet end
                 out.append("}")
                 notehead_markup.tuplet = (1,1)
-            elif re.match(r"g\[[#b',1-9qsdh]+\]$",word):
-                if midi or western: out.append(r"\grace { " + gracenotes_western(word[2:-1],word,line) + " }")
-                else: out.append(r"\grace { " + graceNotes_markup(word[2:-1],word,line,0,isInHarmonic) + " }")
+            elif re.match(r"g\[[#b',1-9qsdh]+\](?:@[0-9=,;^_a-z]+)?$",word):
+                grace_word, _, spec = word.partition('@')
+                notes = grace_word[2:-1]
+                marks = {}
+                if spec:
+                    for assignment in spec.split(';'):
+                        try:
+                            index_text, values = assignment.split('=', 1)
+                            index = int(index_text)
+                            if index < 0 or index >= sum(c in '123456789' for c in notes):
+                                raise ValueError('invalid grace note index')
+                            for value in values.split(','):
+                                direction = value[0] if value and value[0] in '^_' else ''
+                                name = value[len(direction):]
+                                if name not in _GRACE_MARK_NAMES:
+                                    raise ValueError('unsupported grace mark')
+                                marks.setdefault(index, []).append(direction + '\\' + name)
+                        except (ValueError, IndexError):
+                            scoreError("Invalid grace-note marks",word,line)
+                if midi or western: out.append(r"\grace { " + gracenotes_western(notes,word,line,marks) + " }")
+                else: out.append(r"\grace { " + graceNotes_markup(notes,word,line,0,isInHarmonic,marks) + " }")
             elif re.match(r"\[[#b',1-9,q,s,d,h]+\]g$",word):
                 if midi or western: out[lastPtr] = r" \afterGrace { " + out[lastPtr] + " } { " + gracenotes_western(word[1:-2],word,line) + " }"
                 else: out[lastPtr] = r" \afterGrace { " + out[lastPtr] + " } { " + graceNotes_markup(word[1:-2],word,line,1,isInHarmonic) + " }"
@@ -1856,14 +2017,26 @@ def getLY(score,headers=None,have_final_barline=True):
                 DS=r'''} } \volta 2 \volta #'() { \section \sectionLabel "Coda" } }'''
             else: # note (or unrecognised)
                 word0 = word
+                pitch_ties = {}
+                if '@PT' in word:
+                    word, spec = word.split('@PT', 1)
+                    if not re.match(r'^\d+[seio][1-9]\d*(?:,\d+[seio][1-9]\d*)*$', spec):
+                        scoreError("Invalid individual pitch ties",word0,line)
+                    for item in spec.split(','):
+                        match = re.match(r'^(\d+)([seio])([1-9]\d*)$', item)
+                        index, kind, tie_id = int(match.group(1)), match.group(2), int(match.group(3))
+                        buckets = pitch_ties.setdefault(index, ([], [], [], []))
+                        buckets['seio'.index(kind)].append(tie_id)
                 baseOctaveChange = "".join(c for c in word if c in "<>")
                 if baseOctaveChange:
                     notehead_markup.baseOctaveChange(baseOctaveChange)
                     word = "".join(c for c in word if not c in "<>")
                     if not word: continue # allow just < and > by itself in a word
                 figures,nBeams,dots,octave,accidental,tremolo = parseNote(word,word0,line)
+                if pitch_ties and (figures in ('-', '0', 'x') or max(pitch_ties) >= len(figures)):
+                    scoreError("Individual pitch tie has no matching note",word0,line)
                 need_final_barline = True
-                aftrLastNonDash,isDash,b4last,replaceLast,aftrlast,this,need_space_for_accidental,nBeams,octave = notehead_markup(figures,nBeams,dots,octave,accidental,tremolo,word0,line)
+                aftrLastNonDash,isDash,b4last,replaceLast,aftrlast,this,need_space_for_accidental,nBeams,octave = notehead_markup(figures,nBeams,dots,octave,accidental,tremolo,word,line,pitch_ties)
                 if replaceLast: out[lastPtr]=replaceLast
                 if b4last: out[lastPtr]=b4last+out[lastPtr]
                 if aftrlast: out.insert(lastPtr+1,aftrlast)

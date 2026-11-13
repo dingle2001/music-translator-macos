@@ -7,7 +7,6 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from ..config import AUDIVERIS_PINNED_VERSION
 from ..image.image_preprocess import (
     HAS_PILLOW,
     _measure_laplacian_stddev,
@@ -116,12 +115,16 @@ def run_audiveris_batch(
     input_path          : Input score file (PDF / PNG / JPG).
     output_dir          : Directory for Audiveris job outputs.
     skip_preprocessing  : When True, bypass the internal image preprocessing step
-                          (waifu2x SR + Pillow enhancement + downscale).  Set this flag
-                          when the caller has already run enhance_image() upstream.
+                          (Pillow enhancement + downscale).  Set this flag when the
+                          caller has already run enhance_image() upstream.
     """
-    required_java_version = get_audiveris_required_java_version()
-    java_exe = find_java_executable(required_java_version)
     exe = ensure_audiveris_executable()
+    if exe is None:
+        log_message('[audiveris] 找不到启动器。请安装 Audiveris 或设置 AUDIVERIS_EXE_PATH。', logging.WARNING)
+        return None
+    # The official macOS app launcher uses its bundled Java runtime.
+    java_exe = None if exe.parent.name == 'MacOS' else find_java_executable(
+        get_audiveris_required_java_version())
     if output_dir is None:
         output_dir = get_app_base_dir() / 'audiveris-output'
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -192,18 +195,9 @@ def run_audiveris_batch(
         return return_code, stdout, stderr, exported_file
 
     try:
-        if exe is None:
-            log_message('[audiveris] 未能生成或定位启动器。根据官方文档，应先完成源码构建，再使用生成的 Audiveris.bat 运行。', logging.WARNING)
-            log_message(
-                f'[audiveris] 请确认 audiveris-{AUDIVERIS_PINNED_VERSION} 已构建成功，'
-                '或重新运行程序让其自动准备启动器。',
-                logging.WARNING,
-            )
-            return None
-
         log_message(f'[audiveris] 调用启动器: {exe}')
         return_code, stdout, stderr, exported_file = invoke_audiveris(safe_output_dir)
-        if return_code == 0 or exported_file is not None:
+        if exported_file is not None:
             if return_code != 0:
                 log_message('[audiveris] 返回了非零退出码，但已成功导出 MusicXML，继续后续处理。', logging.WARNING)
             log_message('[audiveris] 执行完成。')
@@ -219,8 +213,8 @@ def run_audiveris_batch(
                 page_output_dir = safe_output_dir / f'sheet_{page_number:03d}'
                 safe_remove_tree(page_output_dir)
                 page_output_dir.mkdir(parents=True, exist_ok=True)
-                page_code, page_stdout, page_stderr, page_exported = invoke_audiveris(page_output_dir, sheet_number=page_number)
-                if page_code == 0 or page_exported is not None:
+                _, page_stdout, page_stderr, page_exported = invoke_audiveris(page_output_dir, sheet_number=page_number)
+                if page_exported is not None:
                     success_pages.append(page_number)
                     log_message(f'[audiveris] 第 {page_number} 页已成功导出。')
                 else:
@@ -232,7 +226,13 @@ def run_audiveris_batch(
                     log_message(f'[audiveris] 第 {page_number} 页无法识别为有效五线谱，已跳过。{page_reason}{detail[:240]}', logging.WARNING)
             if success_pages:
                 log_message(f'[audiveris] 已按页完成导出，成功页: {success_pages}')
-                _maybe_merge_mvt_files(safe_output_dir)
+                pages = [find_first_musicxml_file(safe_output_dir / f'sheet_{n:03d}', safe_input_path.stem)
+                         for n in success_pages]
+                merged = _merge_mxl_files([path for path in pages if path is not None],
+                                          safe_output_dir, safe_input_path.stem)
+                if len(success_pages) != page_count or merged is None:
+                    (safe_output_dir / '.partial-omr').write_text(
+                        'Recognition or page merge was incomplete.\n', encoding='utf-8')
                 _copy_preprocessed_ref(omr_preprocessed_path, safe_output_dir)
                 return safe_output_dir
 

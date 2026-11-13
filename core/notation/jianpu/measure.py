@@ -1,4 +1,5 @@
 # core/notation/jianpu/measure.py — Measure-level operations for Jianpu conversion.
+from fractions import Fraction
 from typing import Optional
 
 from music21 import chord as m21chord, note as m21note
@@ -204,6 +205,8 @@ class MeasureBarUnits(list):
         # only — it is never used to lay the measure out.
         self.bar_units: list[int] = []
         self.time_signatures: list[Optional[str]] = []
+        # Zero-based measure index -> (reference pitch class, displayed key).
+        self.key_changes: dict[int, tuple[int, str]] = {}
 
 
 def measure_units(notes: list[JianpuNote]) -> int:
@@ -217,7 +220,7 @@ def measure_units(notes: list[JianpuNote]) -> int:
     return sum(jianpu_note_units(note) for note in notes)
 
 
-def layout_time_word(units: int) -> Optional[str]:
+def layout_time_word(units: int | Fraction) -> Optional[str]:
     """A ``\\time`` word whose jianpu-ly barLength is exactly *units*.
 
     jianpu-ly aborts ("barcheck fail") the moment the notes cross its internal
@@ -230,6 +233,8 @@ def layout_time_word(units: int) -> Optional[str]:
     """
     if units <= 0:
         return None
+    if isinstance(units, Fraction) and units.denominator != 1:
+        return f'LayoutBar:{units.numerator}/{units.denominator}'
     if units % 16 == 0:
         return f'{units // 16}/4'
     if units % 8 == 0:
@@ -308,5 +313,13 @@ def clone_monophonic_element(element, duration: float):
     else:
         new_element = m21note.Note(element.pitch)
         new_element.lyrics = list(element.lyrics)
-    new_element.duration.quarterLength = normalized_duration
+    # Fresh music21 elements otherwise silently lose note-level performance
+    # marks (including fermatas and ornaments) before Jianpu extraction.
+    new_element.articulations = list(getattr(element, 'articulations', ()))
+    new_element.expressions = list(getattr(element, 'expressions', ()))
+    if element.duration.tuplets:
+        import copy
+        new_element.duration = copy.deepcopy(element.duration)
+    else:
+        new_element.duration.quarterLength = normalized_duration
     return new_element

@@ -50,6 +50,10 @@ class ShengChordRenderingTest(unittest.TestCase):
                 token = jianpu_note_token(note_to_jianpu(chord.Chord(pitches), 0))
                 self.assertEqual(self.jly.chordNotes_markup(token, token, token)[2], lily)
 
+    def test_accidental_after_a_chord_octave_belongs_to_the_next_pitch(self):
+        source = self.jly.process_input("1=C\nOctavesAfter\ns#1'b3'5' 0 0 0 s0 s0 s0\n")
+        self.assertIn("< cis'' ees'' g'' >", source)
+
     def test_hidden_jianpu_staff_also_hides_ledger_lines(self):
         # The generator writes the modern dotted property path since the
         # LilyPond 2.20+ switch; `#'` is the legacy spelling. Accept both so the
@@ -67,7 +71,7 @@ class ShengChordRenderingTest(unittest.TestCase):
         # LilyPond 2.26 aborts with "no side-axis setting found for grob Script"
         # unless the custom two-dots/three-dots scripts declare side-axis; the
         # vendored jianpu-ly was backported from upstream for this.
-        self.assertEqual(self.source.count('(side-axis . ,Y)'), 2)
+        self.assertEqual(self.source.count('(side-axis . ,Y)'), 4)
         self.assertEqual(self.source.count('(script-priority . -200)'), 2)
 
 

@@ -31,6 +31,7 @@ work/
 
 # ---- 本地环境 ----
 .venv/
+/models/piano_transcription/
 venv/
 .env
 .claude/

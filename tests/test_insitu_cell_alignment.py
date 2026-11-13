@@ -1,0 +1,265 @@
+"""Measure-aligned vector placement must not stretch glyphs when gaps suffice."""
+import shutil
+import tempfile
+import unittest
+from pathlib import Path
+import numpy as np
+import pymupdf
+
+
+@unittest.skipUnless(shutil.which('lilypond'), 'LilyPond is required by the renderer')
+class CellAlignmentTest(unittest.TestCase):
+    def test_insitu_tile_does_not_restart_bar_numbers_on_each_staff(self):
+        from insitu.render_insitu import _jianpu_ly_source, _render_ly_tile, _run_jianpu_ly
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            measures = ['1 - - -'] * 8
+            ly = _run_jianpu_ly(_jianpu_ly_source([measures], '', '4/4', 'test'), work)
+            tile, _ = _render_ly_tile(ly, work)
+            with pymupdf.open(tile) as doc:
+                # Eight bars of "1" contain no genuine printed "5". LilyPond
+                # otherwise adds a misleading number 5 on every tile.
+                self.assertNotIn('5', doc[0].get_text())
+
+    def test_fifth_bar_number_no_longer_blocks_tie_alignment(self):
+        from insitu.render_insitu import (_jianpu_ly_source, _place_cell, _render_ly_tile,
+                                          _run_jianpu_ly, _tile_barlines)
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            measures = ["- - - 3'", "2'. q1' - -", '- - - #4', '7 - - -',
+                        '- - - -', "6' - - -", "- - - 3'", "5' - - -"]
+            ly = _run_jianpu_ly(_jianpu_ly_source([measures], '', '4/4', 'test'), work)
+            tile, ink = _render_ly_tile(ly, work)
+            with pymupdf.open(tile) as source, pymupdf.open() as target:
+                bars = _tile_barlines(source[0], ink, len(measures))
+                self.assertIsNotNone(bars)
+                clip = pymupdf.Rect(bars[3], ink.y0, bars[4], ink.y1)
+                output = target.new_page(width=200, height=100)
+                self.assertTrue(_place_cell(output, source, clip,
+                                            pymupdf.Rect(20, 20, 72.44, 20 + clip.height)))
+
+    def test_real_lilypond_tie_retains_digit_width(self):
+        from insitu.render_insitu import (_jianpu_ly_source, _place_cell, _render_ly_tile,
+                                          _run_jianpu_ly, _tile_barlines)
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            measures = ["1' - - -", '- - - 6', "3' - - -", "- - - 2'",
+                        "3' 6 1' -", "- - - 2'", '7 - - -', '- - - 6']
+            ly = _run_jianpu_ly(_jianpu_ly_source([measures], '', '4/4', 'test'), work)
+            tile, ink = _render_ly_tile(ly, work)
+            with pymupdf.open(tile) as source:
+                bars = _tile_barlines(source[0], ink, len(measures))
+                self.assertIsNotNone(bars)
+                clip = pymupdf.Rect(bars[2], ink.y0, bars[3], ink.y1)
+                target = pymupdf.open()
+                page = target.new_page(width=200, height=100)
+                self.assertTrue(_place_cell(page, source, clip,
+                                            pymupdf.Rect(20, 20, 72.2, 20 + clip.height)))
+                # The numerical glyph should retain its natural width even
+                # though the arc over it has been fitted to a narrower bar.
+                def glyph_width(page, area):
+                    pix = page.get_pixmap(matrix=pymupdf.Matrix(4, 4), clip=area,
+                                          colorspace=pymupdf.csGRAY, alpha=False)
+                    pixels = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)[:, :pix.width]
+                    columns = np.flatnonzero(np.any(pixels < 100, axis=0))
+                    return int(columns[-1] - columns[0] + 1)
+                # Derive the crop from the note baseline. LilyPond 2.26
+                # positions the system differently on the temporary page.
+                baseline = next(c[2][1] for span in source[0].get_texttrace()
+                                for c in span['chars'] if chr(c[0]) == '3'
+                                and clip.x0 < c[2][0] < clip.x1)
+                original_glyph = pymupdf.Rect(clip.x0 + 4, baseline - 8, clip.x0 + 12, baseline)
+                # Restrict the destination crop to the first digit, away from
+                # the barline and rhythm dashes.
+                y = 20 + baseline - clip.y0
+                result_glyph = pymupdf.Rect(21, y - 8, 32, y)
+                self.assertLessEqual(abs(glyph_width(source[0], original_glyph)
+                                         - glyph_width(page, result_glyph)), 1)
+                target.close()
+
+    def test_slur_band_can_shrink_without_distorting_digits(self):
+        from insitu.render_insitu import _place_cell, _slur_seam
+        source = pymupdf.open()
+        page = source.new_page(width=160, height=80)
+        for x in (10, 110):
+            page.draw_line((x, 7), (x, 39), width=.5)
+        shape = page.new_shape()
+        shape.draw_bezier((20, 16), (35, 6), (85, 6), (100, 16))
+        shape.finish(color=(0, 0, 0), width=.6, closePath=False)
+        shape.commit()
+        for x in (20, 43, 66, 89):
+            page.draw_rect(pymupdf.Rect(x, 23, x + 9, 32), color=None, fill=(0, 0, 0))
+        clip = pymupdf.Rect(10, 5, 110, 40)
+        seam = _slur_seam(page, clip, 90)
+        self.assertIsNotNone(seam)
+        target = pymupdf.open()
+        output = target.new_page(width=160, height=80)
+        self.assertTrue(_place_cell(output, source, clip, pymupdf.Rect(20, 20, 110, 55)))
+        pix = output.get_pixmap(matrix=pymupdf.Matrix(2, 2), colorspace=pymupdf.csGRAY, alpha=False)
+        data = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)
+        row = data[2 * (20 + 23 - 5 + 4)]
+        indices = np.flatnonzero(row[44:216] < 100) + 44
+        runs = np.split(indices, np.where(np.diff(indices) > 1)[0] + 1)
+        self.assertEqual([len(run) for run in runs if len(run) >= 10], [18, 18, 18, 18])
+        self.assertTrue(np.any(data[45:65, 60:180] < 100))  # curve remains visible
+        target.close()
+        source.close()
+
+    def test_slur_partition_rejects_other_ink_above_seam(self):
+        from insitu.render_insitu import _slur_seam
+        source = pymupdf.open()
+        page = source.new_page(width=160, height=80)
+        shape = page.new_shape()
+        shape.draw_bezier((20, 16), (35, 6), (85, 6), (100, 16))
+        shape.finish(color=(0, 0, 0), width=.6, closePath=False)
+        shape.commit()
+        for x in (20, 43, 66, 89):
+            page.draw_rect(pymupdf.Rect(x, 23, x + 9, 32), color=None, fill=(0, 0, 0))
+        page.draw_rect(pymupdf.Rect(30, 6, 34, 9), color=None, fill=(0, 0, 0))
+        self.assertIsNone(_slur_seam(page, pymupdf.Rect(10, 5, 110, 40), 80))
+        source.close()
+
+    def test_slur_band_can_expand_without_distorting_digits(self):
+        from insitu.render_insitu import _place_cell, _slur_seam
+        source = pymupdf.open()
+        page = source.new_page(width=160, height=80)
+        for x in (10, 110):
+            page.draw_line((x, 7), (x, 39), width=.5)
+        shape = page.new_shape()
+        shape.draw_bezier((20, 16), (35, 6), (85, 6), (100, 16))
+        shape.finish(color=(0, 0, 0), width=.6, closePath=False)
+        shape.commit()
+        for x in (20, 43, 66, 89):
+            page.draw_rect(pymupdf.Rect(x, 23, x + 9, 32), color=None, fill=(0, 0, 0))
+        clip = pymupdf.Rect(10, 5, 110, 40)
+        self.assertIsNotNone(_slur_seam(page, clip, 110))
+        # Excessive expansion would move the curve endpoints away from the
+        # corresponding digits, so it must use the reported fallback.
+        self.assertIsNone(_slur_seam(page, clip, 160))
+        target = pymupdf.open()
+        output = target.new_page(width=160, height=80)
+        self.assertTrue(_place_cell(output, source, clip, pymupdf.Rect(20, 20, 130, 55)))
+        pix = output.get_pixmap(matrix=pymupdf.Matrix(2, 2), colorspace=pymupdf.csGRAY, alpha=False)
+        data = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)
+        row = data[2 * (20 + 23 - 5 + 4)]
+        indices = np.flatnonzero(row[44:256] < 100) + 44
+        runs = np.split(indices, np.where(np.diff(indices) > 1)[0] + 1)
+        self.assertEqual([len(run) for run in runs if len(run) >= 10], [18, 18, 18, 18])
+        target.close()
+        source.close()
+
+    def test_cross_bar_curves_fit_without_stretching_digits_or_breaking(self):
+        from insitu.render_insitu import (_jianpu_ly_source, _place_cell, _render_ly_tile,
+                                          _run_jianpu_ly, _tile_barlines)
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            measures = ['6 - - -', r'7 - - ^\fermata -', "1=C #4' - - -",
+                        '- - - -', '- - - -', '- - - -', '0 - - -']
+            ly = _run_jianpu_ly(_jianpu_ly_source([measures], '', '4/4', 'test'), work)
+            tile, ink = _render_ly_tile(ly, work)
+            with pymupdf.open(tile) as source, pymupdf.open() as target:
+                bars = _tile_barlines(source[0], ink, len(measures))
+                self.assertIsNotNone(bars)
+                page = target.new_page(width=300, height=100)
+                x = 20
+                boundaries = []
+                for i, width in ((2, 77.88), (3, 58.92), (4, 57.24)):
+                    clip = pymupdf.Rect(bars[i], ink.y0, bars[i + 1], ink.y1)
+                    self.assertTrue(_place_cell(page, source, clip,
+                                                pymupdf.Rect(x, 10, x + width, 10 + ink.height)))
+                    x += width
+                    boundaries.append(x)
+
+                def digit_widths(p):
+                    return [c['bbox'][2] - c['bbox'][0]
+                            for b in p.get_text('rawdict')['blocks'] for line in b.get('lines', [])
+                            for span in line['spans'] for c in span['chars'] if c['c'] == '4']
+
+                source_width = digit_widths(source[0])[0]
+                self.assertEqual(len(digit_widths(page)), 3)
+                for width in digit_widths(page):
+                    self.assertAlmostEqual(width, source_width, places=2)
+                pix = page.get_pixmap(matrix=pymupdf.Matrix(4, 4), colorspace=pymupdf.csGRAY, alpha=False)
+                data = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)
+                for boundary in boundaries[:-1]:
+                    # The curve crosses each boundary above the barline.
+                    for offset in (-2, 2):
+                        col = round(boundary * 4) + offset
+                        self.assertLess(data[14 * 4:24 * 4, col].min(), 200)
+
+    def test_curve_columns_protect_other_artwork(self):
+        from insitu.render_insitu import _curve_column_runs
+        with pymupdf.open() as source:
+            page = source.new_page(width=160, height=80)
+            shape = page.new_shape()
+            shape.draw_bezier((20, 16), (35, 6), (85, 6), (100, 16))
+            shape.finish(color=(0, 0, 0), width=.6, closePath=False)
+            shape.commit()
+            for x in (20, 90):
+                page.draw_rect(pymupdf.Rect(x, 23, x + 5, 30), color=None, fill=(0, 0, 0))
+            page.draw_rect(pymupdf.Rect(38, 8, 42, 15), color=None, fill=(0, 0, 0))
+            gaps = _curve_column_runs(page, pymupdf.Rect(10, 5, 110, 40))
+            self.assertTrue(gaps)
+            self.assertFalse(any(left < 42 and right > 38 for left, right in gaps))
+
+    def test_each_barline_lands_under_its_source_boundary(self):
+        from insitu.render_insitu import _place_tile
+        from insitu.pdf_structure import Staff, StaffLayout
+        with tempfile.TemporaryDirectory() as tmp:
+            tile = Path(tmp) / 'tile.pdf'
+            source = pymupdf.open()
+            page = source.new_page(width=300, height=100)
+            for x in (10, 80, 180):
+                page.draw_line((x, 10), (x, 30), width=1)
+            for x in (30, 110):
+                page.draw_rect(pymupdf.Rect(x, 15, x + 8, 25), fill=(0, 0, 0), width=0)
+            source.save(tile)
+            source.close()
+            output = pymupdf.open()
+            page = output.new_page(width=350, height=100)
+            layout = StaffLayout(Staff(1, 0, 20, 20, 300, 5), [120, 300])
+            measures = []
+            result = _place_tile(page, tile, pymupdf.Rect(9, 9, 181, 31), layout, 40, 2,
+                                 measure_report=measures)
+            self.assertIn(result, ('aligned', 'scaled'))
+            self.assertEqual([entry['measure_offset'] for entry in measures], [0, 1])
+            self.assertEqual([entry['target_width_points'] for entry in measures], [100, 180])
+            pix = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), colorspace=pymupdf.csGRAY, alpha=False)
+            data = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)
+            for x in (20, 120, 300):
+                self.assertLess(data[100, x * 2 - 2:x * 2 + 3].min(), 100, f'missing bar at {x}')
+            output.close()
+
+    def test_bar_detection_and_elastic_spacing(self):
+        from insitu.render_insitu import _tile_barlines, _place_cell
+        source = pymupdf.open()
+        page = source.new_page(width=300, height=100)
+        for x in (10, 80, 180):
+            page.draw_line((x, 10), (x, 30), width=.5)
+        page.draw_rect(pymupdf.Rect(25, 15, 35, 25), fill=(0, 0, 0), width=0)
+        page.draw_rect(pymupdf.Rect(50, 15, 60, 25), fill=(0, 0, 0), width=0)
+        source.reload_page(page)
+        ink = pymupdf.Rect(9, 9, 181, 31)
+        bars = _tile_barlines(source[0], ink, 2)
+        self.assertEqual(len(bars), 3)
+        self.assertEqual([round(x) for x in bars], [10, 80, 180])
+        target = pymupdf.open()
+        output = target.new_page(width=350, height=100)
+        original = pymupdf.Rect(10, 9, 80, 31)
+        desired = pymupdf.Rect(100, 40, 240, 62)
+        self.assertTrue(_place_cell(output, source, original, desired))
+        pix = output.get_pixmap(colorspace=pymupdf.csGRAY, alpha=False)
+        row = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)[51]
+        indices = np.flatnonzero(row[105:235] < 100) + 105
+        runs = np.split(indices, np.where(np.diff(indices) > 1)[0] + 1)
+        widths = [len(r) for r in runs if len(r) >= 5]
+        self.assertEqual(widths, [10, 10])
+        compressed = target.new_page(width=350, height=100)
+        self.assertTrue(_place_cell(compressed, source, original, pymupdf.Rect(100, 40, 150, 62)))
+        pix = compressed.get_pixmap(colorspace=pymupdf.csGRAY, alpha=False)
+        row = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)[51]
+        indices = np.flatnonzero(row[105:145] < 100) + 105
+        runs = np.split(indices, np.where(np.diff(indices) > 1)[0] + 1)
+        self.assertEqual([len(r) for r in runs if len(r) >= 5], [10, 10])
+        target.close()
+        source.close()

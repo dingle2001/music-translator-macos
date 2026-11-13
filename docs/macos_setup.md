@@ -1,11 +1,13 @@
-# Apple Silicon (arm64) macOS 安装与运行
+# Apple Silicon 安装与使用
 
-目标：在一台**全新、没装 Homebrew、没装 Python 3.11、没装 LilyPond** 的 Apple Silicon Mac 上，
-从零复现"五线谱 PDF → MusicXML → 简谱 PDF"全链路，并可选开启 Core ML。
+在 macOS 27.2.1、arm64、Python 3.11.17、LilyPond 2.26.0 上完成验证。当前工作区已经配置好，双击 `output/五线谱转简谱.app` 可打开原生转换窗口。应用使用构建时记录的源码目录和本机运行环境，移动源码目录后请重新构建。
 
-本文件里的每条命令都在 macOS 27.0.1 / arm64 上实际执行过（2026-10-25）。凡是未验证的步骤都标了 **[未验证]**。
-
----
+```bash
+cd music_translator
+source scripts/env.sh
+python scripts/check_macos_env.py
+bash macos/build.sh
+```
 
 ## 0. 前置条件
 
@@ -29,7 +31,7 @@ xcode-select --install
 
 ## 1. 安装 Python 3.11（arm64）
 
-homr 0.7 要求 Python ≥ 3.11。系统自带的是 3.9，不能用。两条路任选：
+homr 0.7 要求 Python ≥ 3.11。使用 arm64 的 Python 3.11。
 
 ### 方案 A：uv（推荐，无需管理员权限）
 
@@ -72,13 +74,7 @@ python -m pip install -r requirements-macos.txt
 python -m pip install -r requirements.txt
 ```
 
-> 实测解析到 **PyMuPDF 2.0**（上游只写了 `>=1.28.2`）。2.x 会移除 `fitz` 旧别名，
-> 仓库里 `core/omr/multirest_collapse.py`、`run_reference_erhu.py` 仍 `import fitz`，
-> 目前只是 FutureWarning，不影响运行，但升级前需知悉。
-
-没有 CUDA、没有 torch、没有 Java：homr 0.7 的推理链是纯 ONNX。
-
----
+Homr 使用 ONNX Runtime。Audiveris 使用官方 Mac 应用内的 Java。
 
 ## 3. 安装 LilyPond 2.26（arm64，必需）
 
@@ -101,9 +97,7 @@ tar -xzf .toolchain/downloads/lilypond-2.26.0-darwin-arm64.tar.gz \
 export PATH="$PWD/../.toolchain/lilypond/bin:$PATH"
 ```
 
-> **必须打补丁**：LilyPond 2.26 删除了 `set-global-fonts`，且自定义 `two-dots`/`three-dots`
-> 需要 `side-axis`。本仓库 `scripts/jianpu-ly.py` 已含修复（见 `docs/repo_audit.md` F2）。
-> 若你把仓库回退到上游原版，编译会失败——**而且失败后会静默产出一个纯文本 PDF、退出码仍为 0**。
+随仓库提供的 `scripts/jianpu-ly.py` 已兼容 2.26 的自定义记号和装饰音。
 
 **字体缓存告警**：首次运行可能出现多行 `Fontconfig error: No writable cache directories`。
 这是 fontconfig 想写 `~/.cache/fontconfig` 但被限制；不影响输出。消除办法：
@@ -117,21 +111,13 @@ mkdir -p "$XDG_CACHE_HOME"
 
 ## 4. 预下载 OMR 模型权重（强烈建议）
 
-首次识别会自动下载 134 MB（segnet 54 MB + encoder 50 MB + decoder 45 MB），
-仓库对下载只给了 120 s 超时，弱网必然失败。先手动下好：
+首次识别会下载缺少的 Homr 和 OCR 模型。弱网可先预下载 Homr CPU 和默认 Core ML 模型。
 
 ```bash
-# CPU / 基线
-python -c "import homr.main as m; m.download_weights(False, False, False)"
-
-# 如果要试 Core ML（额外 segnet fp16 27 MB + encoder fp16 25 MB）
-python -c "import homr.main as m; m.download_weights(True, False, True)"
+python -c "import homr.main as m; m.download_weights(False, False, False); m.download_weights(True, False, False)"
 ```
 
-权重落在 venv 的 `site-packages/homr/segmentation|transformer/` 下；**删除 venv 会连带删除权重**。
-离线运行 = 依赖已装好 + 权重已就位，之后不再联网。
-
----
+预下载到正在使用的 venv。运行一次样谱也会准备 RapidOCR 资源。
 
 ## 5. 自检
 
@@ -140,45 +126,53 @@ export PATH="$PWD/../.toolchain/lilypond/bin:$PATH"
 python scripts/check_macos_env.py
 ```
 
-期望结尾：`22 项检查：0 失败 / 1 警告`（唯一警告通常是 `waifu2x` 不可用，矢量 PDF 不受影响）。
-任何 `FAIL` 都会在后续步骤变成更难定位的问题，先修。
+Audiveris 未安装时会显示可选项警告。Homr、LilyPond 和模型检查通过后即可运行默认转换。
 
----
-
-## 6. 跑通三条链路
-
-### 6.1 已有 MusicXML → 简谱 PDF（最快验证，不碰 OMR）
+## 6. 转换示例
 
 ```bash
-python jianpu.py tests/fixtures/sheng.pdf \
-    --mxl tests/fixtures/sheng_original.musicxml --mode jianpu -o ../output/sheng
-# → ../output/sheng.jianpu.pdf   约 79 KB / 1 页 / A4
+# 整页和原位对照，默认 Core ML
+python jianpu.py 曲笛.pdf --strict -o ../output/曲笛
+
+# CPU 识别扫描图像
+python jianpu.py input/erhu_p1.png --mode jianpu --backend cpu --strict -o ../output/扫描二胡
+
+# 直接导入 MusicXML，输出固定调简谱、MIDI 和校对文本
+python jianpu.py tests/fixtures/sheng_original.musicxml --mode jianpu --strict \
+  --pitch-mode fixed --fixed-tonic C --midi ../output/笙.mid \
+  --editor-workspace editor-workspace -o ../output/笙
+
+# 有原 PDF 和 MusicXML 时跳过识谱，使用原字号换行
+python jianpu.py tests/fixtures/sheng.pdf --mxl tests/fixtures/sheng_original.musicxml \
+  --mode insitu --layout wrap --strict -o ../output/笙
+
+# 目录批处理，ZIP 中收录成功生成的原位谱
+python batch.py /path/to/pdf-folder --strict -o ../output/批量 --zip ../output/批量/对照谱.zip
 ```
 
-### 6.2 PDF → OMR → MusicXML → 简谱 PDF（CPU 基线）
+默认 `spaced` 保持纸张尺寸并自动分页，`strip` 是它的兼容别名。`stamp` 保留原位置和页数，空白不足时会跳过该行并写入 `*.insitu.report.json`。`--strict` 会拒绝漏页、漏行、备用排版和超限截尾。识谱结果仍以原谱为准，尤其注意报告中的时值、延音和小节数。
+
+`--transpose-to D` 或 `--transpose 2` 改变实际音高，派生 MusicXML 保存在工作目录。固定调只改变简谱的唱名参考。移调后原位 PDF 的五线谱保留源谱。简谱文本可用 `python -m core.app.tui` 的「打开简谱编辑器」校对和重排，TUI 从仓库的 `editor-workspace` 读取。
+
+Mac 窗口也能打开生成的 `.jianpu.txt`，交给文本编辑修改，再点击「开始转换」重新排版。命令行对应 `python jianpu.py 已校对.jianpu.txt --mode jianpu`。
+
+### Audiveris
+
+从 [Audiveris 官方发行页](https://github.com/Audiveris/audiveris/releases/tag/5.11.0) 下载并安装 macOS arm64 版。程序会在 `/Applications`、用户的 `Applications` 或工作区的 `.toolchain/audiveris` 查找。也可以把 `AUDIVERIS_EXE_PATH` 指向 `Audiveris.app/Contents/MacOS/Audiveris`。
 
 ```bash
-python jianpu.py 曲笛.pdf --backend cpu --mode jianpu \
-    --work ../output/work_cpu -o ../output/qudi
-# → ../output/work_cpu/曲笛.musicxml   (282 KB, 193 小节)
-# → ../output/qudi.jianpu.pdf          (62 KB, 3 页)
-# 实测 23.5 s，峰值内存 1.78 GB
+python jianpu.py 曲笛.pdf --omr audiveris --strict -o ../output/曲笛-audiveris
 ```
 
-### 6.3 五线谱/简谱对照 PDF（两种引擎）
+### 钢琴音频
+
+钢琴音频使用独立的可选依赖。安装后首次转换会下载模型。支持 WAV、FLAC、OGG 和 MP3，适用于钢琴录音。
 
 ```bash
-# stamp：页面尺寸与原谱完全一致，逐行贴字
-python jianpu.py 曲笛.pdf --backend cpu --mode insitu --engine stamp -o ../output/qudi_stamp
-
-# strip：在每个谱表系统下方插入简谱条，页面随之加高
-python jianpu.py 曲笛.pdf --backend cpu --mode insitu --engine strip -o ../output/qudi_strip
+python -m pip install torch==2.15.0 piano-transcription-inference==0.0.6 torchlibrosa==0.1.0 \
+  audioread==3.1.0 pretty-midi==0.2.11.post0 librosa==0.11.0 soundfile==0.14.0
+python jianpu.py 钢琴.mp3 --mode jianpu --strict --midi ../output/钢琴.mid -o ../output/钢琴
 ```
-
-> **选哪个**：要"原版式+简谱"用 `stamp`；原谱下方已经很挤、或要重新排版打印用 `strip`。
-> 已知限制：`stamp` 的垂直间距（`Y_OFFSET`）是按单行分谱调的，总谱（谱表间距小）会与下一行相撞。
-
----
 
 ## 7. Core ML / Apple 加速（默认开启）
 
@@ -222,16 +216,11 @@ export PATH="$PWD/../.toolchain/lilypond/bin:$PATH"
 python -m unittest discover -s tests -v
 ```
 
-期望 `Ran 25 tests ... OK`（其中 LilyPond 相关用例在找不到 lilypond 时会 skip）。
-最初的仓库是 9/10，失败项为测试自身过时，见 `docs/repo_audit.md` F4。
-
----
-
 ## 9. 环境变量速查
 
 | 变量 | 作用 |
 |---|---|
-| `LILYPOND` | 直接指定 LilyPond 可执行文件（`insitu` 用） |
+| `LILYPOND` | 直接指定 LilyPond 可执行文件 |
 | `LILYPOND_PATH` / `LILYPOND_HOME` | `core/render/lilypond_runner.py` 的查找根 |
 | `HOMR_BACKEND` | `auto` / `cpu` / `coreml` / `cuda`，CLI `--backend` 优先；macOS 默认 `auto`→coreml |
 | `SUMISORA_ROOT` | 用外部 SumisoraOMR 覆盖内置 `core/` |
@@ -242,25 +231,8 @@ python -m unittest discover -s tests -v
 
 ---
 
-## 10. 故障排查
+## 10. 验收范围
 
-| 现象 | 根因 | 处理 |
-|---|---|---|
-| `Unbound variable: set-global-fonts` | LilyPond ≥ 2.26 + 未打补丁的 jianpu-ly | 确认 `scripts/jianpu-ly.py` 含 `lilypond_minor_version() < 26` 判断 |
-| `no side-axis setting found for grob Script` 后接 `init.ly` 崩溃 | 自定义符号缺 `side-axis` | 确认源码含两处 `(side-axis . ,Y)` |
-| 退出码 0，但 PDF 里是 `(2 4 #6)` 纯文本 | LilyPond 失败后的"备用排版" | 看日志里是否出现 `已生成备用简谱 PDF`；按上两行修根因 |
-| `ImportError: cannot import name 'pad_measure_to_bar'` | 用了未修复的 `insitu/render_insitu.py` | 本仓库已回移该函数；确认 `core/notation/jianpu/measure.py` 存在它 |
-| `barcheck fail: note crosses barline` | 一行一编译时小节时值不匹配 | 同上，`pad_measure_to_bar` 必须参与 `stamp` 渲染 |
-| `[homr] 模型权重下载超时（>120s）` | 首下载超时 | 按 §4 预下载 |
-| `CoreMLExecutionProvider` 存在但耗时没变化 | 参数被 shim 吞掉（历史缺陷） | 本仓库已修；用 `--backend coreml` 后确认生成了 `*.coreml_cache` |
-| `fontconfig: No writable cache directories` | 只读 home | 设 `XDG_CACHE_HOME` |
-| `未找到 waifu2x-ncnn-vulkan` | 可选超分组件缺失 | 矢量 PDF 忽略即可；扫描件需另装 |
+本机已验证 PDF 和图像识谱、MusicXML/MXL 导入、整页和原位排版、移调、MIDI、批量 ZIP、校对文本、钢琴 MP3 转录及 Mac 窗口导出。样谱报告保存在工作区的 `output/macos-parity`、`output/秦兵马俑` 和 `.work`。
 
----
-
-## 11. 未验证事项（如要对外发布必须补）
-
-- Developer ID 签名、公证（notarization）、Gatekeeper 首次启动：**[未验证]**
-- 打包成不依赖系统 Python 的 `.app`（PyInstaller/Nuitka/sidecar）：**[未验证]**
-- Intel / Universal Binary：**[未验证]**（本方案只承诺 arm64）
-- Audiveris 后端（需要 Java）：**[未验证]**
+macOS 交付为依赖本地源码与运行环境的 arm64 应用。独立安装包、公证、Kimi 等多模态校谱、简谱与五线谱同步编辑和完整的人工逐音准确率仍待实现或验收。

@@ -4,11 +4,13 @@ import json
 import logging
 import re
 import shutil
+import sys
+import tempfile
 import textwrap
 from pathlib import Path
 from typing import Optional, cast
 
-from music21 import converter, metadata as m21metadata
+from music21 import converter, metadata as m21metadata, stream
 
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
@@ -17,6 +19,7 @@ from ..config import (
     JianpuNote,
 )
 from ..notation.jianpu import (
+    MAX_SANE_BARS,
     build_jianpu_ly_text,
     choose_measures_per_line,
     format_jianpu_note_text,
@@ -25,7 +28,6 @@ from ..notation.jianpu import (
 )
 from .lilypond_runner import (
     _fix_adjacent_backward_repeats_in_mxl,
-    _fix_omr_artifacts_in_mxl,
     render_lilypond_pdf,
 )
 from .jianpu_runner import (
@@ -95,12 +97,161 @@ def _strip_repeats_for_midi(score) -> int:
     return dropped
 
 
+def _split_tied_chords_for_midi(score) -> int:
+    """Make chord-member ties visible to music21's MIDI translator.
+
+    music21 writes a partly tied Chord as two separately attacked chords.
+    Independent notes at the same offset retain the individual tie states, so
+    a held pitch can continue while other pitches stop or begin. This is only
+    applied to the private MIDI copy, never the source or printed score.
+    """
+    import copy
+    from music21 import chord as m21chord
+
+    count = 0
+    for container in list(score.recurse(streamsOnly=True, includeSelf=True)):
+        for event in list(container.getElementsByClass(m21chord.Chord)):
+            if event.duration.isGrace or not any(member.tie for member in event.notes):
+                continue
+            if len({member.pitch.ps for member in event.notes}) != len(event.notes):
+                log_message('[MIDI] 延音和弦含重复音高，无法可靠拆分，请校对试听。', logging.WARNING)
+                continue
+            offset = event.offset
+            members = []
+            for original in event.notes:
+                member = copy.deepcopy(original)
+                member.duration = copy.deepcopy(event.duration)
+                if member.volume.velocity is None and event.volume.velocity is not None:
+                    member.volume.velocity = event.volume.velocity
+                member.articulations = copy.deepcopy(event.articulations) + member.articulations
+                member.expressions = copy.deepcopy(event.expressions) + member.expressions
+                members.append(member)
+            container.remove(event)
+            for member in members:
+                container.insert(offset, member)
+            count += 1
+    return count
+
+
+def _merge_note_ties_for_midi(score) -> tuple[int, int]:
+    """Join adjacent same-voice, same-pitch ties before music21's MIDI export.
+
+    music21's own tie stripping can merge the wrong note when several separate
+    pitches are tied simultaneously. Work on a private copy and clear the tie
+    markers once exact adjacent pairs have been joined.
+    """
+    from collections import Counter
+    from music21 import note as m21note, stream as m21stream
+
+    merged = issues = 0
+    for part in (list(score.parts) or [score]):
+        events = []
+        for event in part.recurse().getElementsByClass(m21note.Note):
+            parent = event.activeSite
+            current, voice_id = parent, None
+            while current is not None and current is not part:
+                if isinstance(current, m21stream.Voice):
+                    voice_id = str(current.id)
+                    break
+                current = getattr(current, 'activeSite', None)
+            onset = float(event.getOffsetInHierarchy(part))
+            duration = float(event.duration.quarterLength)
+            events.append((onset, voice_id, event.pitch.ps, duration, parent, event))
+        events.sort(key=lambda row: row[0])
+        simultaneous = Counter((onset, voice, pitch) for onset, voice, pitch, _, _, _ in events)
+        ambiguous = {(voice, pitch) for (onset, voice, pitch), count in simultaneous.items() if count > 1}
+        active = {}
+        for onset, voice, pitch, duration, parent, event in events:
+            key = (voice, pitch)
+            kind = event.tie.type if event.tie else None
+            if kind is None:
+                if key in active and onset < active[key][1] + 1e-6:
+                    del active[key]
+                    issues += 1
+                continue
+            event.tie = None
+            if key in ambiguous or kind not in ('start', 'continue', 'stop'):
+                active.pop(key, None)
+                issues += 1
+                continue
+            if kind == 'start':
+                if key in active:
+                    issues += 1
+                active[key] = (event, onset + duration)
+                continue
+            previous = active.get(key)
+            if previous is None or abs(previous[1] - onset) > 1e-6:
+                issues += 1
+                active.pop(key, None)
+                if kind == 'continue':
+                    active[key] = (event, onset + duration)
+                continue
+            first, _ = previous
+            first.duration.quarterLength += event.duration.quarterLength
+            parent.remove(event)
+            merged += 1
+            if kind == 'continue':
+                active[key] = (first, onset + duration)
+            else:
+                del active[key]
+        issues += len(active)
+    return merged, issues
+
+
+def _flatten_parts_for_midi(score):
+    """Keep expanded absolute offsets when a held note crosses a barline."""
+    from music21 import spanner as m21spanner, stream as m21stream
+
+    if not score.parts:
+        return score.flatten()
+    result = m21stream.Score()
+    for element in list(score):
+        offset = score.elementOffset(element)
+        if isinstance(element, m21stream.Part):
+            result.insert(offset, element.flatten())
+        elif not isinstance(element, m21spanner.Spanner):
+            # MIDI has no slur/bracket graphic; other score-level objects
+            # such as tempo marks and metadata still need to be retained.
+            result.insert(offset, element)
+    return result
+
+
 def render_midi_from_score(score, midi_path: Path) -> bool:
     """Export a music21 score to a MIDI file; return True on success.
     All parts are forced to Piano (MIDI program 1) before export.
     """
     try:
+        import copy
+        from music21 import chord as m21chord, stream as m21stream
         from music21 import instrument as m21instrument
+        score = copy.deepcopy(score)
+        has_ties = any(
+            any(member.tie for member in event.notes) if isinstance(event, m21chord.Chord)
+            else bool(event.tie)
+            for event in score.recurse().notes
+        )
+        if has_ties:
+            # Expand repeats while bar durations are intact. Joining an
+            # eight-beat tie inside a four-beat measure *before* expansion
+            # otherwise shifts the following measure and repeat boundary.
+            if score[m21stream.Measure]:
+                try:
+                    score = score.expandRepeats()
+                except Exception as exc:
+                    if not _is_repeat_expansion_failure(exc):
+                        raise
+                    dropped = _strip_repeats_for_midi(score)
+                    log_message(f'[MIDI] 反复记号不成对，已忽略 {dropped} 处，请校对试听。', logging.WARNING)
+                    score = score.expandRepeats()
+            split_count = _split_tied_chords_for_midi(score)
+            merged_count, tie_issues = _merge_note_ties_for_midi(score)
+            score = _flatten_parts_for_midi(score)
+            if split_count:
+                log_message(f'[MIDI] 按音符保留 {split_count} 个延音和弦。')
+            elif merged_count:
+                log_message(f'[MIDI] 合并 {merged_count} 个已匹配的延音片段。')
+            if tie_issues:
+                log_message(f'[MIDI] {tie_issues} 处延音不完整或有歧义，请校对试听。', logging.WARNING)
         midi_path.parent.mkdir(parents=True, exist_ok=True)
         # 统一乐器为钢琴，避免 OMR 引擎写入的乐器编号影响回放音色
         for part in score.parts:
@@ -140,7 +291,8 @@ def render_midi_from_musicxml(mxl_path: Path, midi_path: Path) -> bool:
     preview's play button regenerating a missing .mid). Returns True on success.
     """
     try:
-        score = converter.parse(str(mxl_path))
+        from ..notation.musicxml_wedges import parse_musicxml_compatible
+        score = parse_musicxml_compatible(mxl_path)
     except Exception as exc:
         log_message(f'解析乐谱失败: {mxl_path.name}，原因: {exc}', logging.WARNING)
         return False
@@ -391,7 +543,11 @@ def build_lilypond_title_markup(title: str, composer: str = '') -> str:
     if not safe_title:
         return ''
 
-    lilypond_font_name = resolve_lilypond_font_name() or 'Sans'
+    lilypond_font_name = resolve_lilypond_font_name()
+    if lilypond_font_name is None and sys.platform == 'darwin':
+        if Path('/System/Library/Fonts/Hiragino Sans GB.ttc').is_file():
+            lilypond_font_name = 'Hiragino Sans GB'
+    lilypond_font_name = lilypond_font_name or 'Sans'
     safe_font_name = escape_lilypond_text(lilypond_font_name)
     composer_line = ''
     if composer.strip():
@@ -639,6 +795,11 @@ def render_score_to_jianpu_pdf(
     lyrics_lines: Optional[list[str]] = None,
     composer: str = '',
     tempo: int = 0,
+    source_wedges=None,
+    pitch_mode: str = 'movable',
+    fixed_tonic: str = 'C',
+    strict: bool = False,
+    multirest_counts: Optional[dict[int, int]] = None,
 ) -> tuple[bool, list[list[int]], dict[int, dict[str, bool]]]:
     """
     Render a music21 score to jianpu PDF.
@@ -653,16 +814,23 @@ def render_score_to_jianpu_pdf(
     """
     _repeat_barlines: dict = {}
     try:
-        _jly_result = build_jianpu_ly_text(score, title, composer=composer, tempo=tempo, _return_groups=True)
+        _jly_result = build_jianpu_ly_text(score, title, composer=composer, tempo=tempo,
+                                          _return_groups=True, _source_wedges=source_wedges,
+                                          pitch_mode=pitch_mode, fixed_tonic=fixed_tonic,
+                                          multirest_counts=multirest_counts)
         txt_content, _voice_groups, _repeat_barlines = cast(
             tuple[str, list[list[int]], dict], _jly_result
         )
     except Exception as exc:
         _voice_groups = []
+        if strict:
+            log_message(f'[jianpu] 简谱文本生成失败: {exc}', logging.WARNING)
+            return False, [], {}
         log_message(f'[jianpu] 标准 jianpu-ly 文本生成失败 ({exc})，尝试使用简化处理', logging.WARNING)
         try:
             from ..notation.jianpu import parse_score_to_jianpu, build_jianpu_ly_text_from_measures
-            measures, header_lines, time_sig = parse_score_to_jianpu(score)
+            measures, header_lines, time_sig = parse_score_to_jianpu(
+                score, pitch_mode=pitch_mode, fixed_tonic=fixed_tonic)
             key_header = header_lines[0].split()[0] if header_lines else '1=C'
             txt_content = build_jianpu_ly_text_from_measures(measures, time_sig, key_header, title,
                                                               composer=composer, tempo=tempo)
@@ -676,7 +844,8 @@ def render_score_to_jianpu_pdf(
 
     try:
         from ..notation.jianpu import parse_score_to_jianpu
-        measures, header_lines, _ = parse_score_to_jianpu(score)
+        measures, header_lines, _ = parse_score_to_jianpu(
+            score, pitch_mode=pitch_mode, fixed_tonic=fixed_tonic)
     except Exception as exc:
         log_message(f'[jianpu] parse_score_to_jianpu 失败: {exc}，跳过中间产物保存', logging.WARNING)
         measures, header_lines = [], []
@@ -691,12 +860,17 @@ def render_score_to_jianpu_pdf(
             copy_generated_pdf(pdf_path, output_pdf_path)
             log_message(f'已通过 LilyPond 生成简谱 PDF: {output_pdf_path.name}')
             return True, _voice_groups, _repeat_barlines
+        if strict:
+            return False, [], {}
         log_message('标准 jianpu-ly 路径失败，尝试严格按拍号重建简谱。', logging.WARNING)
     else:
+        if strict:
+            return False, [], {}
         log_message('文本版 jianpu-ly 失败，尝试严格按拍号重建简谱。', logging.WARNING)
 
     strict_txt_content = build_jianpu_ly_text(score, title, use_strict_timing=True,
-                                               composer=composer, tempo=tempo)
+                                               composer=composer, tempo=tempo,
+                                               pitch_mode=pitch_mode, fixed_tonic=fixed_tonic)
     txt_path.write_text(strict_txt_content, encoding='utf-8')  # type: ignore[arg-type]
     if render_jianpu_ly(txt_path, ly_path):
         log_message(f'已通过严格拍号重建生成 jianpu-ly 文件: {ly_path.name}')
@@ -710,6 +884,8 @@ def render_score_to_jianpu_pdf(
     else:
         log_message('MIDI 中转后的严格拍号路径也失败，切换到备用简谱排版。', logging.WARNING)
 
+    if any(getattr(event, 'notations', ()) for measure in measures for event in measure):
+        log_message('[jianpu] 备用图形或文字排版不能完整显示音符演奏记号，请校对。', logging.WARNING)
     font_name = register_pdf_font()
     try:
         create_pdf(output_pdf_path, title, measures, header_lines, font_name, lyrics_lines)
@@ -735,7 +911,7 @@ _EDITOR_HEADER_TEMPLATE = """\
 #
 # 【简谱符号说明】
 #  数字音符：  1=Do  2=Re  3=Mi  4=Fa  5=Sol  6=La  7=Si  0=休止符
-#  升降号：    #1=升Do  b3=降Mi（写在数字前面）
+#  升降号：    #1=升Do  b3=降Mi  ##4=重升Fa  bb7=重降Si（写在数字前面）
 #  高八度：    1'=高音Do  1''=超高音Do（单引号 ' 写在数字后面）
 #  低八度：    1,=低音Do  1,,=超低音Do（逗号 , 写在数字后面）
 #  时值（四分音符=1拍）：
@@ -750,7 +926,7 @@ _EDITOR_HEADER_TEMPLATE = """\
 #    q1.      附点八分音符（0.75 拍）
 #  小节线：    用 | 分隔小节
 #  换行排版：  NextPart（不影响音高，仅控制排版换行）
-#  注意：以 # 开头的行是注释，不影响转换
+#  注意：以 # 加空格开头的行是注释；#1、##1 等是音符
 # ================================================================
 
 """
@@ -808,6 +984,25 @@ def parse_jianpu_meta_comment(header_text: str) -> tuple[list[list[int]], dict[i
         except (ValueError, TypeError, AttributeError):
             return [], {}
     return [], {}
+
+
+def render_edited_jianpu(txt_path: Path, output_pdf: Path, title: str) -> bool:
+    """Typeset a saved proofreading file and retain its repeat metadata."""
+    from .lilypond_runner import render_jianpu_ly as render_editor_source
+
+    groups, repeats = parse_jianpu_meta_comment(txt_path.read_text(encoding='utf-8-sig'))
+    with tempfile.TemporaryDirectory(prefix='jianpu_edit_') as temporary:
+        ly_path = Path(temporary) / 'score.ly'
+        if not render_editor_source(txt_path, ly_path):
+            return False
+        sanitize_generated_lilypond_file(ly_path, title)
+        merge_polyphonic_jianpu_staves(ly_path, groups)
+        inject_repeat_barlines_to_ly(ly_path, repeats)
+        pdf = render_lilypond_pdf(ly_path)
+        if pdf is None:
+            return False
+        copy_generated_pdf(pdf, output_pdf)
+        return True
 
 
 def _build_validation_annotation(errors: list) -> str:
@@ -910,6 +1105,10 @@ def generate_jianpu_pdf_from_mxl(
     editor_workspace_dir: Optional[Path] = None,
     composer: str = '',
     tempo_bpm: int = 0,
+    pitch_mode: str = 'movable',
+    fixed_tonic: str = 'C',
+    strict: bool = False,
+    multirest_counts: Optional[dict[int, int]] = None,
 ) -> bool:
     """
     Generate a jianpu PDF from MusicXML: parse MXL → render jianpu PDF directly.
@@ -932,12 +1131,27 @@ def generate_jianpu_pdf_from_mxl(
         # flow and the staff-PDF flow see correct start/end repeat structure.
         # Pass temp_dir so each concurrent worker writes its own isolated copy.
         _mxl_for_parse = _fix_adjacent_backward_repeats_in_mxl(mxl_path, temp_dir)
-        # Remove phantom voices and merge chord-identical voices, preserving notes
-        # so that music21 sees a clean score.  Chord-consolidated voices become
-        # music21 Chord objects; clone_monophonic_element() then keeps only the
-        # highest pitch per chord — correct monophonic behaviour for jianpu.
-        _mxl_for_parse = _fix_omr_artifacts_in_mxl(_mxl_for_parse, temp_dir)
+        from ..notation.musicxml_wedges import remove_continuation_markers_for_parser
+        _mxl_for_parse = remove_continuation_markers_for_parser(_mxl_for_parse, temp_dir)
+        # Keep the source voice structure intact.  Rhythmically identical
+        # voices or voices containing only rests are not sufficient evidence
+        # that MusicXML content is an OMR artefact or an unvoiced chord.
         source_score = converter.parse(str(_mxl_for_parse))
+        if strict and any(len(part.getElementsByClass(stream.Measure)) > MAX_SANE_BARS
+                          for part in source_score.parts):
+            log_message(f'[jianpu] 超过 {MAX_SANE_BARS} 小节，严格模式拒绝截尾。', logging.WARNING)
+            return False
+        try:
+            from ..notation.musicxml_wedges import read_wedges
+            source_wedges, wedge_issues = read_wedges(mxl_path)
+            for part_index, measure_index, issue in wedge_issues:
+                location = f'分部 {part_index + 1}'
+                if measure_index is not None:
+                    location += f' 小节 {measure_index + 1}'
+                log_message(f'[jianpu] {location}：{issue}，请校对。', logging.WARNING)
+        except Exception as exc:
+            source_wedges = None
+            log_message(f'[jianpu] 无法读取 MusicXML 渐强渐弱线，请校对：{exc}', logging.WARNING)
 
         # Source file stem (preferred_title) is always authoritative — OMR engines write
         # internal filenames like "homr_input" that must not leak into the PDF title.
@@ -959,27 +1173,16 @@ def generate_jianpu_pdf_from_mxl(
             if _raw_composer.lower() not in ('', 'music21', 'composer'):
                 composer = _raw_composer
 
-        # Extract tempo from score if not pre-supplied.
-        if tempo_bpm <= 0:
-            try:
-                from music21 import tempo as m21tempo
-                _tempos = list(source_score.flatten().getElementsByClass(m21tempo.MetronomeMark))
-                if _tempos:
-                    tempo_bpm = int(round(_tempos[0].number))
-            except Exception:
-                pass
-
-        # 装饰音只留在 MusicXML 里（存档给移调器、五线谱渲染用），简谱和 MIDI 都不要：
-        # - 简谱没有装饰音记法，留着会被当成普通音符排进小节、把后面的音挤出节拍；
-        # - music21 写 MIDI 时把第一个装饰音当成一整拍、其余的丢掉，后面的音全部后移。
-        _graces = strip_grace_notes(source_score)
-        if _graces:
-            log_message(f'[jianpu] 简谱与 MIDI 不含装饰音，已略去 {_graces} 个', logging.DEBUG)
-
-        # Use the original parsed score for MIDI — preserves all parts and voices.
+        # Keep grace notes in Jianpu. music21 MIDI export mishandles their
+        # duration, so remove them only from the separate MIDI copy.
         if midi_output_path is not None:
-            if not render_midi_from_score(source_score, midi_output_path):
+            import copy
+            midi_score = copy.deepcopy(source_score)
+            strip_grace_notes(midi_score)
+            if not render_midi_from_score(midi_score, midi_output_path):
                 log_message('简谱 MIDI 生成失败，跳过 MIDI 输出，继续生成简谱 PDF。', logging.WARNING)
+                if strict:
+                    return False
 
         # Use the MXL-parsed score directly — preserves exact note durations and pitches
         # 歌词现在由 build_jianpu_ly_text 直接写进 jianpu-ly 文本的 L:/H: 行（见
@@ -988,7 +1191,9 @@ def generate_jianpu_pdf_from_mxl(
         log_message('当前转换链路: 乐谱文件(PDF/JPG/PNG) -> MXL/MusicXML -> 简谱 PDF')
         result, _voice_groups_out, _repeat_barlines_out = render_score_to_jianpu_pdf(
             source_score, title, output_pdf_path, temp_dir, txt_path, ly_path,
-            composer=composer, tempo=tempo_bpm,
+            composer=composer, tempo=tempo_bpm, source_wedges=source_wedges,
+            pitch_mode=pitch_mode, fixed_tonic=fixed_tonic, strict=strict,
+            multirest_counts=multirest_counts,
         )
 
         # Preserve editor workspace files when the conversion succeeded

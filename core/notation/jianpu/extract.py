@@ -2,7 +2,7 @@
 import logging as _logging
 from typing import Optional
 
-from music21 import chord as m21chord, note as m21note, stream
+from music21 import chord as m21chord, key as m21key, note as m21note, spanner, stream
 
 from ...config import JianpuNote
 from ...utils import log_message
@@ -13,6 +13,10 @@ from .primitives import (
     normalize_jianpu_duration,
     note_to_jianpu,
     split_duration_chunks,
+    _get_score_key_tonic,
+    _reference_step_from_header,
+    _tonic_result,
+    fixed_reference,
 )
 from .measure import (
     MeasureBarUnits,
@@ -40,14 +44,83 @@ def _element_duration(item) -> float:
     return float(getattr(duration, 'quarterLength', duration) or 0.0)
 
 
+def _mark_tuplet_groups(notes: list[JianpuNote]) -> None:
+    """Mark consecutive tuplet events for the jianpu-ly ``3[ ... ]`` syntax.
+
+    A group that ends short (OMR dropped one of its notes) leaves the measure
+    with a fractional 64th-note total, and jianpu-ly's bar length is an integer,
+    so the whole staff would fail to render.  Complete such a group with a
+    tuplet rest at its end; the log names the measure so the insertion can be
+    reviewed.
+    """
+    # Grace notes consume no tuplet slot and must not split a group.  Work on
+    # the time-bearing events, then splice the (possibly extended) sequence back
+    # so the caller's list receives any inserted rests.
+    events = [event for event in notes if not event.is_grace]
+    index = 0
+    while index < len(events):
+        first = events[index]
+        if not first.tuplet_actual or not first.tuplet_normal:
+            index += 1
+            continue
+        ratio = (first.tuplet_actual, first.tuplet_normal)
+        end = index + 1
+        while end < len(events) and (events[end].tuplet_actual, events[end].tuplet_normal) == ratio:
+            end += 1
+        cursor = index
+        while cursor < end:
+            stop = cursor
+            explicit = any(n.tuplet_type in ('start', 'stop', 'startStop') for n in events[cursor:end])
+            if explicit:
+                if events[cursor].tuplet_type not in ('start', 'startStop'):
+                    log_message('[jianpu] 连音符缺少起始标记或跨越小节，请校对。', _logging.WARNING)
+                while stop < end:
+                    if stop > cursor and events[stop].tuplet_type == 'start':
+                        stop -= 1
+                        break
+                    if events[stop].tuplet_type in ('stop', 'startStop'):
+                        break
+                    stop += 1
+                stop = min(stop, end - 1)
+            else:
+                stop = min(end - 1, cursor + ratio[0] - 1)
+            short = (explicit and events[stop].tuplet_type not in ('stop', 'startStop')) \
+                or (not explicit and stop - cursor + 1 < ratio[0])
+            if short and stop == len(events) - 1 and stop - cursor + 1 >= 2:
+                # Completing a trailing short group cannot move any music that
+                # still follows it in the measure, and it makes the measure's
+                # 64th-note total an integer again (jianpu-ly bars are integral).
+                template = events[stop]
+                written = template.written_duration or template.duration
+                for _ in range(ratio[0] - (stop - cursor + 1)):
+                    events.insert(stop + 1, JianpuNote(
+                        '0', '', 0, 0, float(template.duration), 0, None, True,
+                        written_duration=float(written),
+                        tuplet_actual=ratio[0], tuplet_normal=ratio[1],
+                    ))
+                    stop += 1
+                    end += 1
+                log_message('[jianpu] 连音符分组不完整；已在组尾补休止符保持小节时值完整，请校对。',
+                            _logging.INFO)
+            elif short:
+                log_message('[jianpu] 连音符分组不完整或跨越小节，请校对。', _logging.WARNING)
+            events[cursor].tuplet_start = True
+            events[stop].tuplet_stop = True
+            cursor = stop + 1
+        index = end
+
+    if len(events) != len(notes):
+        remaining = iter(events)
+        rebuilt = [next(remaining) if not event.is_grace else event for event in notes]
+        rebuilt.extend(remaining)
+        notes[:] = rebuilt
+
+
 def strip_grace_notes(score) -> int:
     """Remove grace notes from *score* in place and return how many were removed.
 
-    Jianpu output has no grace-note notation, and the extractors treat every note
-    as sounding: a grace note left in is laid out as an extra note and pushes the
-    rest of its measure off the beat. music21's MIDI export mishandles them too (the
-    first one sounds for a full beat and shifts everything after it; the rest are
-    dropped), so the renderer strips them before writing either.
+    Used on a separate MIDI copy because music21's MIDI export mishandles grace
+    duration. The Jianpu extractor keeps them as zero-time ornaments.
     """
     removed = 0
     for container in score.recurse(streamsOnly=True, includeSelf=True):
@@ -58,102 +131,16 @@ def strip_grace_notes(score) -> int:
 
 
 def _canonical_offset(seen: dict[int, float], offset: float) -> float:
-    """Collapse float-epsilon variants of one musical onset onto a single dict key.
+    """Merge numerical noise only, keeping genuinely distinct onsets apart.
 
-    by_offset 用 float 直接做字典键时，三连音类 offset（1/3 等无限小数）经不同
-    计算路径产生的浮点误差变体会把"同一位置"分裂成两个键，绕过所有 tol 容差。
-    这里按 1/64 音符网格（QL×16 取整）判定身份，返回该网格首次出现的**原始**
-    offset——量化只用于去重，不用于时值运算：三连音 1/3 若被吸附到 5/16，
-    下游 `next_offset - offset` 会把时值改写成附点十六分，musically 错误。
+    A fixed 1/64-note grid conflates distinct notes in shorter tuplets.  The
+    small tolerance handles floating point noise without snapping to a rhythm.
     """
-    return seen.setdefault(round(offset * 16), offset)
-
-
-def _get_voice_ids_in_part(part) -> list[str]:
-    """Return sorted voice IDs that contain significant non-rest content.
-
-    A voice is significant — and warrants its own jianpu polyphony track — when:
-      1. it has actual notes in at least 2 distinct measures (the original guard
-         against single-measure harmony chords triggering multi-voice extraction), AND
-      2. it is either the most prolific voice in the part (always kept), OR
-         it meets the secondary-voice significance test (see below).
-
-    Secondary-voice significance test (both of the following must be true):
-      a. note count >= 10 % of the primary voice's note count, AND
-      b. EITHER note count >= 8 (the original guard against 2-measure OMR stray voices)
-         OR the voice spans at least 4 distinct measures.
-
-    Rationale for the OR branch: OMR stray voices typically appear in exactly 2
-    (occasionally 3) consecutive measures with a handful of notes.  A voice spread
-    across 4 or more measures — even with fewer than 8 total notes — is far more
-    likely to be a genuine polyphonic voice (e.g. a later-entering canon voice that
-    is only sparsely tagged with voice numbers in the MusicXML) than an OMR artefact.
-    The 10 % floor prevents near-empty one-off notes from being promoted regardless.
-    """
-    voice_stats: dict[str, tuple[int, int]] = {}  # vid -> (measure_count, note_count)
-    for measure in part.getElementsByClass(stream.Measure):
-        for voice in measure.voices:
-            n_notes = sum(1 for e in voice.flatten().notes if isinstance(e, m21note.Note))
-            if n_notes > 0:
-                vid = str(voice.id)
-                m_count, prev = voice_stats.get(vid, (0, 0))
-                voice_stats[vid] = (m_count + 1, prev + n_notes)
-
-    candidates = [vid for vid, (m_count, _) in voice_stats.items() if m_count >= 2]
-    if len(candidates) <= 1:
-        return sorted(candidates)
-
-    primary_vid = max(candidates, key=lambda v: voice_stats[v][1])
-    primary_notes = voice_stats[primary_vid][1]
-    return sorted(
-        vid for vid in candidates
-        if vid == primary_vid
-        or (
-            voice_stats[vid][1] >= primary_notes * 0.10
-            and (voice_stats[vid][1] >= 8 or voice_stats[vid][0] >= 4)
-        )
-    )
-
-
-def _secondary_voice_overlaps_primary(
-    part, primary_vid: str, secondary_vid: str, overlap_threshold: float = 0.5
-) -> bool:
-    """Return True when the secondary voice is likely OMR false-polyphony.
-
-    For each non-rest note in the secondary voice, checks whether its onset falls
-    *strictly inside* the duration span of any primary-voice note in the same measure
-    (i.e. p_start < onset < p_end).  Notes that start simultaneously with a primary
-    note (chords) or exactly at the primary note's end are intentionally excluded.
-
-    If the fraction of such "inside" notes exceeds *overlap_threshold* the secondary
-    voice is treated as a duplicate detection artifact rather than genuine counterpoint,
-    and the caller should skip it to prevent visual number overlap in the jianpu output.
-    """
-    total = 0
-    inside = 0
-    for measure in part.getElementsByClass(stream.Measure):
-        v_list = list(measure.voices)
-        if not v_list:
-            continue
-        v1 = next((v for v in v_list if str(v.id) == primary_vid), None)
-        v2 = next((v for v in v_list if str(v.id) == secondary_vid), None)
-        if v1 is None or v2 is None:
-            continue
-        # 主声部非休止符元素的时值区间 (onset, onset+dur)
-        p_spans: list[tuple[float, float]] = [
-            (float(el.offset), float(el.offset) + float(el.duration.quarterLength or 0.25))
-            for el in v1.flatten().notesAndRests
-            if isinstance(el, (m21note.Note, m21chord.Chord))
-        ]
-        for el in v2.flatten().notesAndRests:
-            if not isinstance(el, (m21note.Note, m21chord.Chord)):
-                continue
-            total += 1
-            onset = float(el.offset)
-            # 严格落在主声部音符时值内部（不含同时起音和恰好在结束点的情形）
-            if any(p_start < onset < p_end for p_start, p_end in p_spans):
-                inside += 1
-    return total > 0 and (inside / total) >= overlap_threshold
+    for previous in seen.values():
+        if abs(previous - offset) <= 1e-7:
+            return previous
+    seen[len(seen)] = offset
+    return offset
 
 
 def _extract_part_repeat_barlines(part) -> dict[int, dict[str, bool]]:
@@ -180,54 +167,36 @@ def _extract_part_repeat_barlines(part) -> dict[int, dict[str, bool]]:
         if has_start or has_end:
             result[i] = {'start': has_start, 'end': has_end}
 
-    # Validate: drop repeat sections that span too few notes (likely Audiveris false positives).
-    # Pair each start-repeat measure with the nearest following end-repeat measure;
-    # if the section contains fewer than 4 non-rest notes, discard the entire pair.
-    _MIN_NOTES = 4
-    starts = sorted(mi for mi, f in result.items() if f.get('start'))
-    ends   = sorted(mi for mi, f in result.items() if f.get('end'))
-    _used_ends: set[int] = set()
-    _drop: set[int] = set()
-    for _s in starts:
-        _e = next((x for x in ends if x >= _s and x not in _used_ends), None)
-        if _e is not None:
-            _used_ends.add(_e)
-            _note_count = sum(
-                1 for _mi in range(_s, min(_e + 1, len(measures)))
-                for _el in measures[_mi].flatten().notesAndRests
-                if not getattr(_el, 'isRest', True)
-            )
-            if _note_count < _MIN_NOTES:
-                _drop.add(_s)
-                _drop.add(_e)
-    for _mi in _drop:
-        result.pop(_mi, None)
-
     return result
 
 
 def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
                              _part=None, _voice_id: str = '1',
-                             _multi_voice_mode: bool = False,
-                             _is_primary_voice: bool = True) -> tuple[list[list[JianpuNote]], str]:
+                             *, follow_key_changes: bool = False,
+                             pitch_mode: str = 'movable',
+                             fixed_tonic: str = 'C') -> tuple[list[list[JianpuNote]], str]:
     """
     Extract jianpu measure list and time signature from a music21 score.
     Merges polyphony by offset; fills gaps and overflows with rests at bar boundaries.
 
+    Source scores are monophonic, so a measure that contains several MusicXML
+    voices yields one line: the voice named by ``_voice_id`` when present,
+    otherwise the voice carrying the most notes.  Extra voices are OMR noise.
+
     Parameters
     ----------
     _part              : If provided, use this Part stream directly instead of score.parts[0].
-    _voice_id          : Which voice ID to extract when a measure contains multiple voices.
+    _voice_id          : Voice ID to follow when a measure contains several voices.
                          Defaults to '1' (main melody).
-    _multi_voice_mode  : When True (multi-voice extraction), a measure that lacks the
-                         requested voice emits a whole-measure rest instead of falling
-                         back to another voice's content.  This prevents secondary voices
-                         from duplicating the primary melody in monophonic measures.
-    _is_primary_voice  : When *_multi_voice_mode* is True, the primary voice still gets the
-                         flat measure content when the measure has no explicit voice
-                         containers.  Secondary voices (``_is_primary_voice=False``) emit
-                         rests in such measures.
+    follow_key_changes : Apply source key changes at measure boundaries and
+                         expose their headers through ``measures.key_changes``.
     """
+    if pitch_mode not in ('movable', 'fixed'):
+        raise ValueError(f'unsupported pitch mode: {pitch_mode}')
+    fixed_step: str | None = None
+    if pitch_mode == 'fixed':
+        key_tonic_semitone, fixed_step, _ = fixed_reference(fixed_tonic)
+        follow_key_changes = False
     part = _part if _part is not None else (score.parts[0] if score.parts else score.flatten())
     time_signature = '4/4'
     nominal_measure_length = 4.0
@@ -237,9 +206,13 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
         nominal_measure_length = float(getattr(time_sig[0].barDuration, 'quarterLength', 4.0) or 4.0)
 
     measures: MeasureBarUnits = MeasureBarUnits()
+    initial_tonic, initial_header = _get_score_key_tonic(score)
+    active_header = initial_header if initial_tonic == key_tonic_semitone else None
+    tonic_step = fixed_step if pitch_mode == 'fixed' else _reference_step_from_header(active_header, key_tonic_semitone)
     measure_streams = list(part.getElementsByClass(stream.Measure))
     if not measure_streams:
-        fallback_notes = [note_to_jianpu(element, key_tonic_semitone) for element in part.flatten().notesAndRests]
+        fallback_notes = [note_to_jianpu(element, key_tonic_semitone, tonic_step=tonic_step)
+                          for element in part.flatten().notesAndRests]
         fallback = MeasureBarUnits([fallback_notes] if fallback_notes else [])
         if fallback:
             fallback.bar_units.append(_parse_bar_units(time_signature))
@@ -274,11 +247,48 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
             _first_measure_length_override = _fallback_ql
 
     tol = 0.01
+    # A dash repeats the preceding event's *entire* pitch set. Only use it
+    # when the previous adjacent source event ties every one of those pitches.
+    previous_source = None
+    next_pitch_tie_id = 1
     # How long the previous measure's *content* actually was.  Only used to give
     # a measure the OMR left completely empty a sane width — see the ``not
     # by_offset`` branch below.
     _previous_content = nominal_measure_length or 4.0
+    deferred_key = None
     for _m_idx, measure in enumerate(measure_streams):
+        if follow_key_changes:
+            boundary_key = deferred_key
+            deferred_key = None
+            for signature in measure.recurse().getElementsByClass(m21key.KeySignature):
+                signature_offset = float(signature.getOffsetInHierarchy(measure))
+                try:
+                    if isinstance(signature, m21key.Key):
+                        ref, header = _tonic_result(signature.tonic, signature.mode)
+                        explicit_mode = True
+                    else:
+                        major = signature.asKey('major')
+                        ref, header = _tonic_result(major.tonic, 'major')
+                        explicit_mode = False
+                except Exception:
+                    log_message(f'[jianpu] 小节 {_m_idx + 1} 的调号无法转换，保持之前的唱名；'
+                                '请核对。', _logging.WARNING)
+                    continue
+                candidate = (ref, header, explicit_mode)
+                if abs(signature_offset) < 1e-7:
+                    boundary_key = candidate
+                else:
+                    deferred_key = candidate
+                    log_message(f'[jianpu] 小节 {_m_idx + 1} 中途变调，保持当前唱名并在下一小节切换；'
+                                '请核对调号位置。', _logging.WARNING)
+            if boundary_key is not None:
+                ref, header, explicit_mode = boundary_key
+                changed_spelling = (active_header and active_header.startswith('1=')
+                                    and header.startswith('1=') and active_header != header)
+                if ref != key_tonic_semitone or (explicit_mode and active_header != header) or changed_spelling:
+                    measures.key_changes[_m_idx] = (ref, header)
+                    key_tonic_semitone, active_header = ref, header
+                    tonic_step = _reference_step_from_header(active_header, key_tonic_semitone)
         # The measure's length is decided *after* its notes are collected: it is
         # wherever the model's last note ends (see ``measure_length`` below).
         # No time signature is consulted — a bar the OMR under-filled keeps its
@@ -286,32 +296,39 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
         # keeps every note (nothing is dropped or clamped).  The pickup
         # detection above stays only for the signature word shown in the UI.
         by_offset: dict[float, list[object]] = {}
-        _offset_seen: dict[int, float] = {}  # 1/64 网格 → 首见原始 offset（P1-4 去重）
+        tie_review_candidates: dict[int, str] = {}
+        pitch_tie_records: dict[int, tuple[list, list]] = {}
+        _offset_seen: dict[int, float] = {}  # Preserve first offset for epsilon-only deduplication.
+        slur_boundaries: dict[tuple[float, tuple[int, ...]], list[int]] = {}
+        for source_note in measure.recurse().notes:
+            if getattr(source_note.duration, 'isGrace', False):
+                continue
+            pitches = (tuple(sorted(p.ps for p in source_note.pitches))
+                       if isinstance(source_note, m21chord.Chord) else (source_note.pitch.ps,))
+            key = (round(float(source_note.getOffsetInHierarchy(measure)), 7), pitches)
+            for slur in source_note.getSpannerSites(spanner.Slur):
+                ends = slur.getSpannedElements()
+                # Grace-note curves are already rendered by the grace syntax.
+                if len(ends) < 2 or any(getattr(e.duration, 'isGrace', False)
+                                        for e in (ends[0], ends[-1])):
+                    continue
+                flags = slur_boundaries.setdefault(key, [0, 0])
+                flags[0] += int(slur.isFirst(source_note))
+                flags[1] += int(slur.isLast(source_note))
 
-        # 合并同小节延音线（cross-measure tie-stop 音符在本小节内无对应 start，
-        # stripTies 会保留其时值不变；仅合并同小节内的 start→stop 对）
-        try:
-            measure_src = measure.stripTies(retainContainers=True)
-        except Exception:
-            measure_src = measure
+        # Keep tied fragments separate: merging can create a duration such as
+        # 2.5 quarters that one Jianpu token cannot express, causing truncation.
+        measure_src = measure
 
-        # 简谱为单声部格式；使用 _voice_id 参数选取目标声部。
-        # 单声部模式下 _voice_id='1'，多声部渲染时由调用方传入具体 ID。
+        # 简谱为单声部格式：一个小节只取一条线。
+        # 优先取 _voice_id，缺失时取音符最多的声部（music21 有时会把实际内容放进
+        # 非 '1' 的声部容器，直接取 _voices[0] 会丢掉整小节）。
         _voices = list(measure_src.voices)
         if _voices:
             _matching_voice = next((v for v in _voices if str(v.id) == _voice_id), None)
             if _matching_voice is not None:
                 _flat_all = list(_matching_voice.flatten().notesAndRests)
-            elif _multi_voice_mode:
-                # Multi-voice mode: this voice doesn't exist in this measure → whole-measure rest.
-                # Do NOT fall back to another voice's content.
-                _flat_all = []
             else:
-                # Single-voice mode fallback: pick the voice with the most non-rest notes.
-                # music21 sometimes places a rest-only Voice container alongside other voices
-                # that hold the actual notes (e.g. when an OMR-tagged sub-voice steals the
-                # measure's content from the nominal main voice); falling back to _voices[0]
-                # in that case would silently drop all real notes for the measure.
                 _best_voice = max(
                     _voices,
                     key=lambda v: sum(
@@ -320,42 +337,82 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
                 )
                 _flat_all = list(_best_voice.flatten().notesAndRests)
         else:
-            if _multi_voice_mode and not _is_primary_voice:
-                # No voice containers in this measure + secondary voice.
-                # HOMR sometimes encodes 2-voice polyphony with <chord/> tags instead of
-                # separate <voice> containers.  When chord objects exist, the lower pitch
-                # belongs to the secondary voice; recover those notes rather than emitting
-                # a whole-measure rest.  Single notes (no chord sibling) belong solely to
-                # the primary voice and are left alone.
-                _chord_lowers: list[m21note.Note] = []
-                for _el in measure_src.flatten().notesAndRests:
-                    if isinstance(_el, m21chord.Chord) and len(_el.pitches) >= 2:
-                        _lower_p = min(_el.pitches, key=lambda p: p.midi)
-                        _lower_n = m21note.Note(_lower_p)
-                        _lower_n.duration.quarterLength = float(_el.duration.quarterLength or 0.25)
-                        _lower_n.offset = float(_el.offset)
-                        _chord_lowers.append(_lower_n)
-                _flat_all = _chord_lowers  # remains [] when no chords → whole-measure rest
-            else:
-                _flat_all = list(measure_src.flatten().notesAndRests)
+            _flat_all = list(measure_src.flatten().notesAndRests)
 
         for element in _flat_all:
             offset = _canonical_offset(_offset_seen, float(element.offset))
+            if getattr(element.duration, 'isGrace', False):
+                grace = note_to_jianpu(element, key_tonic_semitone, tonic_step=tonic_step)
+                grace.is_grace = True
+                grace.duration = 0.0
+                by_offset.setdefault(offset, []).append(grace)
+                continue
+            full_continuation = False
+            tie_review = ''
+            tie_record = None
+            if isinstance(element, m21note.Rest):
+                previous_source = None
+            else:
+                component_notes = sorted(list(element.notes) if isinstance(element, m21chord.Chord)
+                                         else [element], key=lambda n: n.pitch.ps)
+                source_pitches = tuple(n.pitch.ps for n in component_notes)
+                tie_types = [n.tie.type if n.tie else None for n in component_notes]
+                incoming = [kind in ('stop', 'continue') for kind in tie_types]
+                outgoing = [kind in ('start', 'continue') for kind in tie_types]
+                absolute_offset = float(measure.getOffsetInHierarchy(part)) + offset
+                adjacent = bool(previous_source is not None
+                                and abs(previous_source[2] - absolute_offset) <= 1e-6)
+                matched_full = bool(
+                    incoming and all(incoming) and previous_source is not None
+                    and previous_source[0] == source_pitches and previous_source[1]
+                    and adjacent)
+                # A chord that continues as a whole but then releases only
+                # some pitches needs visible noteheads for the outgoing ties.
+                partial_outgoing = any(outgoing) and not all(outgoing)
+                full_continuation = matched_full and not partial_outgoing
+                tie_record = ([], [])
+                if not full_continuation and adjacent and previous_source is not None:
+                    if len(set(source_pitches)) == len(source_pitches):
+                        for index, (pitch, is_incoming) in enumerate(zip(source_pitches, incoming)):
+                            if not is_incoming or pitch not in previous_source[3]:
+                                continue
+                            anchor = previous_source[4].get(pitch)
+                            if anchor is None:
+                                continue
+                            anchor_record, anchor_index = anchor
+                            tie_id = next_pitch_tie_id
+                            next_pitch_tie_id += 1
+                            anchor_record[0].append((anchor_index, tie_id))
+                            tie_record[1].append((index, tie_id))
+                if (any(incoming) and not full_continuation) or (any(outgoing) and not all(outgoing)):
+                    tie_review = ('partial_chord_tie' if isinstance(element, m21chord.Chord)
+                                  and len(set(tie_types)) > 1 else 'unmatched_tie')
+                    log_message(
+                        f'[jianpu] 小节 {_m_idx + 1}、位置 {offset:g} 的部分延音或不匹配延音'
+                        '需要校对（跨行时可能无法完整显示）；已保留所有音符。', _logging.WARNING)
+                outgoing_pitches = {pitch for pitch, flag in zip(source_pitches, outgoing) if flag}
+                if full_continuation and previous_source is not None:
+                    anchors = {pitch: previous_source[4][pitch] for pitch in outgoing_pitches
+                               if pitch in previous_source[4]}
+                elif len(set(source_pitches)) == len(source_pitches):
+                    anchors = {pitch: (tie_record, index) for index, pitch in enumerate(source_pitches)
+                               if pitch in outgoing_pitches}
+                else:
+                    anchors = {}
+                previous_source = (source_pitches, bool(outgoing and all(outgoing)),
+                                   absolute_offset + float(element.duration.quarterLength),
+                                   outgoing_pitches, anchors)
             # 跨小节 tie-stop/continue：上一小节 tie-start 音符在本小节内的延续。
             # 渲染为延音 dash（'-'），而非独立音符或休止符。
-            _tie = getattr(element, 'tie', None)
-            if _tie is not None and _tie.type in ('stop', 'continue'):
-                cont_dur = normalize_jianpu_duration(float(element.duration.quarterLength or 1.0))
-                cont = JianpuNote(
-                    symbol='-',
-                    accidental='',
-                    upper_dots=0,
-                    lower_dots=0,
-                    duration=cont_dur,
-                    duration_dots=infer_duration_dots(cont_dur),
-                    midi=None,
-                    is_rest=False,
-                )
+            if full_continuation:
+                cont = note_to_jianpu(element, key_tonic_semitone, tonic_step=tonic_step)
+                cont.tie_review = tie_review
+                pitches = (cont.midi, *[p[4] for p in cont.chord_notes])
+                starts, stops = slur_boundaries.pop((round(offset, 7), pitches), (0, 0))
+                cont.slur_starts, cont.slur_stops = starts, stops
+                cont.symbol, cont.accidental = '-', ''
+                cont.upper_dots = cont.lower_dots = 0
+                cont.midi, cont.chord_notes, cont.lyrics = None, (), {}
                 existing = by_offset.get(offset)
                 if existing is None:
                     by_offset[offset] = [cont]
@@ -367,6 +424,10 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
             # the OMR had over-filled, and stopped earlier bars from being "too
             # long" at all.)
             candidate = clone_monophonic_element(element, float(element.duration.quarterLength or 0.25))
+            if tie_record is not None:
+                pitch_tie_records[id(candidate)] = tie_record
+            if tie_review:
+                tie_review_candidates[id(candidate)] = tie_review
             existing = by_offset.get(offset)
             if existing is None:
                 by_offset[offset] = [candidate]
@@ -380,7 +441,7 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
             # is not padding to fit a signature.
             measure_length = _previous_content
             measures.append([
-                note_to_jianpu(_rest_of(piece), key_tonic_semitone)
+                note_to_jianpu(_rest_of(piece), key_tonic_semitone, tonic_step=tonic_step)
                 for piece in (split_duration_chunks(measure_length) or [measure_length])
             ])
             measures.bar_units.append(int(round(measure_length * 16)))
@@ -410,7 +471,7 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
                 for piece in split_duration_chunks(gap):
                     rest_piece = m21note.Rest()
                     rest_piece.duration.quarterLength = piece
-                    measure_notes.append(note_to_jianpu(rest_piece, key_tonic_semitone))
+                    measure_notes.append(note_to_jianpu(rest_piece, key_tonic_semitone, tonic_step=tonic_step))
                     current_offset += piece
 
             next_offset = offsets[idx + 1] if idx + 1 < len(offsets) else measure_length
@@ -421,7 +482,14 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
                     measure_notes.append(element)
                     element_end = max(element_end, offset + element.duration)
                 else:
-                    jn = note_to_jianpu(element, key_tonic_semitone)
+                    jn = note_to_jianpu(element, key_tonic_semitone, tonic_step=tonic_step)
+                    jn.tie_review = tie_review_candidates.get(id(element), '')
+                    if id(element) in pitch_tie_records:
+                        jn.pitch_tie_starts, jn.pitch_tie_stops = pitch_tie_records[id(element)]
+                    if not jn.is_rest:
+                        pitches = (jn.midi, *[p[4] for p in jn.chord_notes])
+                        starts, stops = slur_boundaries.pop((round(offset, 7), pitches), (0, 0))
+                        jn.slur_starts, jn.slur_stops = starts, stops
                     measure_notes.append(jn)
                     element_end = max(element_end, offset + jn.duration)
             # 填充音符实际结束位置到下一个音符开始位置之间的空白（OMR 漏标休止符的常见情形）
@@ -430,13 +498,14 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
                 for piece in split_duration_chunks(gap):
                     rest_piece = m21note.Rest()
                     rest_piece.duration.quarterLength = piece
-                    measure_notes.append(note_to_jianpu(rest_piece, key_tonic_semitone))
+                    measure_notes.append(note_to_jianpu(rest_piece, key_tonic_semitone, tonic_step=tonic_step))
             current_offset = next_offset
 
         # No trailing rest: the measure already ends with the model's last note,
         # so there is nothing left to fill.  (This is the step that used to append
         # the stray '0's whenever the OMR's own note total fell short of the
         # signature it had guessed.)
+        _mark_tuplet_groups(measure_notes)
         measures.append(measure_notes)
         # Log what this measure's notes add up to, verbatim.  The jianpu-ly text
         # builder recomputes the same sum from the emitted tokens and makes it the
@@ -448,7 +517,8 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
 
 
 def extract_strict_jianpu_measures(score, key_tonic_semitone: int = 0,
-                                    _part=None) -> tuple[list[list[JianpuNote]], str]:
+                                    _part=None, *, pitch_mode: str = 'movable',
+                                    fixed_tonic: str = 'C') -> tuple[list[list[JianpuNote]], str]:
     """
     Extract jianpu measures by re-slicing all notes strictly by bar length,
     ignoring the score's own Measure objects.
@@ -459,11 +529,20 @@ def extract_strict_jianpu_measures(score, key_tonic_semitone: int = 0,
             All voices are merged (flattened) — use extract_jianpu_measures with
             _voice_id for per-voice extraction.
     """
+    if pitch_mode not in ('movable', 'fixed'):
+        raise ValueError(f'unsupported pitch mode: {pitch_mode}')
+    fixed_step: str | None = None
+    if pitch_mode == 'fixed':
+        key_tonic_semitone, fixed_step, _ = fixed_reference(fixed_tonic)
     part = _part if _part is not None else (score.parts[0] if score.parts else score.flatten())
+    initial_tonic, header = _get_score_key_tonic(score)
+    tonic_step = (fixed_step if pitch_mode == 'fixed' else
+                  _reference_step_from_header(header, key_tonic_semitone)
+                  if initial_tonic == key_tonic_semitone else None)
     # 合并延音线：同小节 start→stop 对合并为单音符；跨小节 tie 的合并音符由
-    # append_element_chunks 正确跨 bar 拆分，因此用 retainContainers=True 即可。
+    # append_element_chunks 正确跨 bar 拆分。
     try:
-        part = part.stripTies(retainContainers=True)
+        part = part.stripTies()
     except Exception:
         pass
     time_signature = '4/4'
@@ -496,7 +575,7 @@ def extract_strict_jianpu_measures(score, key_tonic_semitone: int = 0,
             _trailing_rest_pickup = True
 
     by_offset: dict[float, object] = {}
-    _offset_seen: dict[int, float] = {}  # 1/64 网格 → 首见原始 offset（P1-4 去重）
+    _offset_seen: dict[int, float] = {}  # Preserve first offset for epsilon-only deduplication.
     for element in part.flatten().notesAndRests:
         offset = _canonical_offset(_offset_seen, float(element.offset))
         if offset < 0 or offset >= max_score_offset:
@@ -507,7 +586,7 @@ def extract_strict_jianpu_measures(score, key_tonic_semitone: int = 0,
             by_offset[offset] = candidate
         elif isinstance(existing, m21note.Rest) and not isinstance(candidate, m21note.Rest):
             by_offset[offset] = candidate
-        elif isinstance(existing, m21note.Note) and isinstance(candidate, m21note.Note) and candidate.pitch.midi > existing.pitch.midi:
+        elif isinstance(existing, m21note.Note) and isinstance(candidate, m21note.Note) and candidate.pitch.ps > existing.pitch.ps:
             by_offset[offset] = candidate
 
     # For trailing-rest pickups: rebuild by_offset so that the layout matches
@@ -576,7 +655,7 @@ def extract_strict_jianpu_measures(score, key_tonic_semitone: int = 0,
                 return
             for piece in split_duration_chunks(piece_total):
                 element_piece = clone_monophonic_element(element_template, piece)
-                current_measure.append(note_to_jianpu(element_piece, key_tonic_semitone))
+                current_measure.append(note_to_jianpu(element_piece, key_tonic_semitone, tonic_step=tonic_step))
                 current_pos += piece
             remaining -= piece_total
             # 判断当前位置是否恰好是小节边界

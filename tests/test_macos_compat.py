@@ -68,7 +68,7 @@ class LilyPondCompatTest(unittest.TestCase):
             self.assertIn('set-global-fonts', self.source)
 
     def test_custom_scripts_declare_side_axis(self):
-        self.assertEqual(self.source.count('(side-axis . ,Y)'), 2)
+        self.assertEqual(self.source.count('(side-axis . ,Y)'), 4)
 
     def test_generated_source_compiles(self):
         exe = os.environ.get('LILYPOND') or shutil.which('lilypond')

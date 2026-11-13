@@ -1,8 +1,9 @@
 # core/notation/jianpu/primitives.py — Note/duration primitives for Jianpu conversion.
 
 import logging as _logging
+from fractions import Fraction
 
-from music21 import chord as m21chord, note as m21note
+from music21 import articulations as m21art, chord as m21chord, expressions as m21expr, note as m21note
 
 from ...config import (
     ALLOWED_JIANPU_DURATIONS,
@@ -80,49 +81,33 @@ def _get_score_key_tonic(score) -> tuple[int, str]:
     the piece's *actual* tonic (see ``_format_key_header``).
 
     Detection priority:
-    1. ``Key`` element — explicit tonic + mode (most authoritative).
-    2. ``KeySignature`` element (fifths only, no mode) + ``score.analyze('key')``
-       to disambiguate major/minor — mirrors the transposer's
-       ``_parse_musicxml_key_signature`` + ``detect_key_from_musicxml`` logic
-       but adds mode resolution.  Handles OMR engines (e.g. Homr) that write
-       ``<fifths>`` without ``<mode>``.
-    3. ``score.analyze('key')`` tonic alone — for scores with no key-signature
+    1. Earliest key signature.  An explicit ``Key`` supplies its mode; for a
+       fifths-only ``KeySignature``, analysis chooses major/minor.
+    2. ``score.analyze('key')`` tonic alone — for scores with no key-signature
        element at all.
-    4. First actual note — last resort (no mode info; treated as major).
+    3. First actual note — last resort (no mode info; treated as major).
     """
     from music21 import key as m21key  # local import to avoid circular at module level
     try:
-        # Priority 1: explicit Key element (has both fifths and mode)
-        key_sigs = _first_part(score).flatten().getElementsByClass(m21key.Key)
-        if key_sigs:
-            key = key_sigs[0]
-            return _tonic_result(key.tonic, key.mode)
-    except Exception:
-        pass
-
-    try:
-        # Priority 2: KeySignature (fifths only) + statistical mode detection
-        # music21 parses MusicXML <key><fifths>N</fifths></key> (no <mode>) as
-        # KeySignature, not Key.  We combine the explicit accidental count with
-        # Krumhansl-Schmuckler analysis to determine major vs minor, then call
-        # asKey(mode) to obtain the correct tonic.
         ksigs = _first_part(score).flatten().getElementsByClass(m21key.KeySignature)
         if ksigs:
             ks = ksigs[0]
+            if isinstance(ks, m21key.Key):
+                return _tonic_result(ks.tonic, ks.mode)
             analyzed = score.analyze('key')
             mode = analyzed.mode if analyzed else 'major'
             return _tonic_result(ks.asKey(mode).tonic, mode)
     except Exception:
         pass
 
-    # Priority 3: pure statistical analysis (no key-signature element at all)
+    # Priority 2: pure statistical analysis (no key-signature element at all)
     try:
         analyzed = score.analyze('key')
         return _tonic_result(analyzed.tonic, analyzed.mode)
     except Exception:
         pass
 
-    # Priority 4: first actual note — last resort (no mode info; treated as major)
+    # Priority 3: first actual note — last resort (no mode info; treated as major)
     try:
         for element in _first_part(score).flatten().notesAndRests:
             if isinstance(element, m21note.Note) and element.pitch is not None:
@@ -188,6 +173,10 @@ def get_duration_render(duration: float, dots: int) -> tuple[int, int, int]:
         return 0, 3, 1
     if abs(duration - 0.125) < tol:
         return 0, 3, 0
+    if abs(duration - 0.09375) < tol:
+        return 0, 4, 1
+    if abs(duration - 0.0625) < tol:
+        return 0, 4, 0
     return 0, 1, dots
 
 
@@ -221,7 +210,8 @@ def build_lyric_lines(measures: 'list[list[JianpuNote]]') -> list[str]:
     if not ENABLE_LYRICS_OUTPUT:
         return []
 
-    non_rest = [note for measure in measures for note in measure if not note.is_rest]
+    non_rest = [note for measure in measures for note in measure
+                if not note.is_rest and not getattr(note, 'is_grace', False)]
     verses: set[int] = set()
     for note in non_rest:
         verses.update(note.lyrics.keys())
@@ -276,12 +266,56 @@ def _extract_lyrics(element) -> dict[int, tuple[str, bool]]:
     return result
 
 
-def _pitch_to_fields(pitch, key_tonic_semitone: int) -> tuple[str, str, int, int, int]:
+def _reference_step_from_header(header: str | None, tonic_semitone: int) -> str | None:
+    """Return the relative-major tonic letter if the header matches the reference."""
+    if not header or '=' not in header:
+        return None
+    try:
+        from music21.pitch import Pitch
+        degree, name = header.split('=', 1)
+        tonic = Pitch(name.replace('b', '-'))
+        if degree == '6':
+            tonic = _relative_major_tonic(tonic)
+        elif degree != '1':
+            return None
+        return tonic.step if tonic.pitchClass == tonic_semitone % 12 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def fixed_reference(name: str = 'C') -> tuple[int, str, str]:
+    """Resolve a fixed-Do reference such as ``C``, ``D`` or ``Bb``.
+
+    Returns ``(pitch-class semitone, diatonic step letter, header name)`` so
+    fixed-pitch jianpu can number notes from any reference note, not only C.
+    """
+    from music21.pitch import Pitch
+    cleaned = (name or 'C').strip()
+    if not cleaned:
+        cleaned = 'C'
+    try:
+        pitch = Pitch(cleaned[0].upper() + cleaned[1:].replace('b', '-'))
+    except Exception as exc:  # music21 raises PitchException for bad step names
+        raise ValueError(f'无效的固定调主音: {name!r}（应为 C、D、Bb、F# 之类的音名）') from exc
+    return pitch.pitchClass, pitch.step, pitch.name.replace('-', 'b')
+
+
+def _pitch_to_fields(pitch, key_tonic_semitone: int,
+                     tonic_step: str | None = None) -> tuple[str, str, int, int, int]:
     """Map a music21 Pitch to (accidental, symbol, upper_dots, lower_dots, midi).
 
     Movable-Do: the pitch-class of *key_tonic_semitone* becomes '1'.
     """
-    note_midi = pitch.midi
+    pitch_space = getattr(pitch, 'ps', None)
+    if pitch_space is not None and abs(pitch_space - round(pitch_space)) > 1e-7:
+        _log_message('[jianpu] 微分音无法用当前简谱符号准确表示，已取整半音，请校对。', _logging.WARNING)
+    # music21's MIDI accessor folds out-of-range pitches back by octaves.
+    # Preserve integral pitch-space values for notation even when MIDI cannot
+    # represent them; otherwise an extreme note silently changes register.
+    note_midi = (int(round(pitch_space)) if pitch_space is not None
+                 and abs(pitch_space - round(pitch_space)) < 1e-7 else pitch.midi)
+    if note_midi is not None and not 0 <= note_midi <= 127:
+        _log_message('[jianpu] 音符超出 MIDI 音高范围，请校对排版和试听。', _logging.WARNING)
     if note_midi is None:
         _step_pc = {'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11}
         _alter = int(pitch.accidental.alter) if pitch.accidental else 0
@@ -293,6 +327,22 @@ def _pitch_to_fields(pitch, key_tonic_semitone: int) -> tuple[str, str, int, int
     diff = note_midi - key_midi_ref
     relative_semitone = diff % 12
     octave_offset = diff // 12
+
+    # Preserve the diatonic spelling when it fits Jianpu's supported
+    # accidentals. Pitch-class-only conversion changes, for example, C-major
+    # B-flat into #6 instead of b7 even though both sound the same.
+    steps = 'CDEFGAB'
+    if tonic_step and tonic_step in steps and getattr(pitch, 'step', None) in steps:
+        degree = (steps.index(pitch.step) - steps.index(tonic_step)) % 7
+        natural_semitone = (0, 2, 4, 5, 7, 9, 11)[degree]
+        alter = (diff - natural_semitone) % 12
+        if alter > 6:
+            alter -= 12
+        if alter in (-2, -1, 0, 1, 2):
+            accidental = {-2: 'bb', -1: 'b', 0: '', 1: '#', 2: '##'}[alter]
+            octave_offset = (diff - natural_semitone - alter) // 12
+            return accidental, str(degree + 1), max(octave_offset, 0), max(-octave_offset, 0), note_midi
+        _log_message('[jianpu] 原音名需要三重或更多升降唱名，暂用等音代替，请校对。', _logging.WARNING)
 
     if relative_semitone in _DIATONIC_SEMITONES:
         symbol = _DIATONIC_SEMITONES[relative_semitone]
@@ -308,7 +358,67 @@ def _pitch_to_fields(pitch, key_tonic_semitone: int) -> tuple[str, str, int, int
     return accidental, symbol, upper_dots, lower_dots, note_midi
 
 
-def note_to_jianpu(element, key_tonic_semitone: int = 0) -> JianpuNote:
+def _source_notations(element) -> tuple[str, ...]:
+    """Convert recognized note-level marks to safe LilyPond post-events."""
+    kinds = {
+        m21art.Accent: 'accent', m21art.StrongAccent: 'marcato',
+        m21art.Staccato: 'staccato', m21art.Staccatissimo: 'staccatissimo',
+        m21art.Tenuto: 'tenuto', m21expr.Fermata: 'fermata',
+        m21expr.Trill: 'trill', m21expr.Mordent: 'mordent',
+        m21expr.InvertedMordent: 'prall', m21expr.Turn: 'turn',
+        m21expr.InvertedTurn: 'reverseturn',
+    }
+    result = []
+    for mark in (*getattr(element, 'articulations', ()), *getattr(element, 'expressions', ())):
+        if isinstance(mark, m21art.BreathMark) and not element.duration.isGrace:
+            result.append(r'\breathe')
+            continue
+        command = kinds.get(type(mark))
+        if command is None:
+            _log_message(f'[jianpu] 未支持的音符演奏记号 {type(mark).__name__}，请校对。', _logging.WARNING)
+            continue
+        if isinstance(mark, m21expr.Fermata):
+            shape = getattr(mark, 'shape', 'normal')
+            shapes = {'normal': 'fermata', None: 'fermata', '': 'fermata',
+                      'angled': 'shortfermata', 'square': 'longfermata'}
+            if shape in shapes:
+                command = shapes[shape]
+            else:
+                _log_message('[jianpu] 未支持的延长记号形状暂按普通延长记号显示，请校对。', _logging.WARNING)
+        if type(mark) is m21art.StrongAccent and getattr(mark, 'pointDirection', 'up') != 'up':
+            _log_message('[jianpu] 强重音的方向未必能准确还原，请校对。', _logging.WARNING)
+        if any(getattr(mark, attr, None) is not None for attr in ('accidental', 'upperAccidental', 'lowerAccidental')):
+            _log_message('[jianpu] 装饰音附带的升降号未完整表示，请校对。', _logging.WARNING)
+        placement = getattr(mark, 'placement', None)
+        direction = '^' if placement == 'above' else '_' if placement == 'below' else ''
+        if isinstance(mark, m21expr.Fermata):
+            # MusicXML type describes the glyph orientation. music21 does not
+            # import fermata placement, so use LilyPond's directed script.
+            direction = '_' if mark.type == 'inverted' else '^' if mark.type == 'upright' else direction
+        result.append(direction + '\\' + command)
+    return tuple(result)
+
+
+def _apply_tuplet_metadata(result: JianpuNote, element) -> JianpuNote:
+    result.notations = _source_notations(element)
+    tuplets = element.duration.tuplets
+    if len(tuplets) == 1 and not element.duration.isGrace:
+        tuplet = tuplets[0]
+        result.tuplet_actual = int(tuplet.numberNotesActual or 0)
+        result.tuplet_normal = int(tuplet.numberNotesNormal or 0)
+        if result.tuplet_actual <= 0 or result.tuplet_normal <= 0:
+            _log_message('[jianpu] 连音符比例无效，请校对该小节', _logging.WARNING)
+            result.tuplet_actual = result.tuplet_normal = 0
+            return result
+        result.tuplet_type = tuplet.type
+        result.written_duration = float(element.duration.quarterLength) * result.tuplet_actual / result.tuplet_normal
+    elif len(tuplets) > 1:
+        _log_message('[jianpu] 嵌套连音符尚不支持，请校对该小节', _logging.WARNING)
+    return result
+
+
+def note_to_jianpu(element, key_tonic_semitone: int = 0, *,
+                   tonic_step: str | None = None) -> JianpuNote:
     """Convert a music21 note, rest or chord to a JianpuNote dataclass (Movable-Do / 首调唱名法).
 
     *key_tonic_semitone* is the pitch-class (0–11) of the reference tonic
@@ -321,7 +431,7 @@ def note_to_jianpu(element, key_tonic_semitone: int = 0) -> JianpuNote:
     on one rhythmic slot instead of collapsing it to a single pitch.
     """
     if isinstance(element, m21note.Rest):
-        return JianpuNote(
+        return _apply_tuplet_metadata(JianpuNote(
             symbol='0',
             accidental='',
             upper_dots=0,
@@ -330,22 +440,22 @@ def note_to_jianpu(element, key_tonic_semitone: int = 0) -> JianpuNote:
             duration_dots=int(getattr(element.duration, 'dots', 0)),
             midi=None,
             is_rest=True,
-        )
+        ), element)
 
     # ── Chord: lowest pitch is the primary, higher pitches become chord_notes ──
     # A one-pitch Chord is still a Chord (music21 writes one when a single stem
     # carries a <chord/> flag), and it has no .pitch attribute: handling it here
     # renders it as a plain note instead of raising AttributeError (中音笙).
     if isinstance(element, m21chord.Chord) and element.pitches:
-        _sorted_pitches = sorted(element.pitches, key=lambda p: p.midi if p.midi is not None else 0)
+        _sorted_pitches = sorted(element.pitches, key=lambda p: p.ps if p.ps is not None else 0)
         accidental, symbol, upper_dots, lower_dots, note_midi = _pitch_to_fields(
-            _sorted_pitches[0], key_tonic_semitone
+            _sorted_pitches[0], key_tonic_semitone, tonic_step
         )
         chord_notes = tuple(
-            _pitch_to_fields(p, key_tonic_semitone)[:5] for p in _sorted_pitches[1:]
+            _pitch_to_fields(p, key_tonic_semitone, tonic_step)[:5] for p in _sorted_pitches[1:]
         )
         # 规范化：_pitch_to_fields 返回 (acc, sym, up, low, midi)，即 chord_notes 的元素顺序
-        return JianpuNote(
+        return _apply_tuplet_metadata(JianpuNote(
             symbol=symbol,
             accidental=accidental,
             upper_dots=upper_dots,
@@ -356,23 +466,23 @@ def note_to_jianpu(element, key_tonic_semitone: int = 0) -> JianpuNote:
             is_rest=False,
             lyrics=_extract_lyrics(element),
             chord_notes=chord_notes,
-        )
+        ), element)
 
     pitch = element.pitch
     if pitch is None:
-        return JianpuNote(
+        return _apply_tuplet_metadata(JianpuNote(
             symbol='?', accidental='', upper_dots=0, lower_dots=0,
             duration=float(element.duration.quarterLength),
             duration_dots=int(getattr(element.duration, 'dots', 0)),
             midi=None, is_rest=False,
             lyrics=_extract_lyrics(element),
-        )
+        ), element)
 
     accidental, symbol, upper_dots, lower_dots, note_midi = _pitch_to_fields(
-        pitch, key_tonic_semitone
+        pitch, key_tonic_semitone, tonic_step
     )
 
-    return JianpuNote(
+    return _apply_tuplet_metadata(JianpuNote(
         symbol=symbol,
         accidental=accidental,
         upper_dots=upper_dots,
@@ -382,7 +492,7 @@ def note_to_jianpu(element, key_tonic_semitone: int = 0) -> JianpuNote:
         midi=note_midi,
         is_rest=False,
         lyrics=_extract_lyrics(element),
-    )
+    ), element)
 
 
 def format_jianpu_note_text(note: JianpuNote) -> str:
@@ -418,7 +528,7 @@ def jianpu_octave_symbol(upper_dots: int, lower_dots: int) -> str:
     return ''
 
 
-def jianpu_note_token(note: JianpuNote) -> str:
+def _jianpu_note_token_unmarked(note: JianpuNote) -> str:
     """Produce the jianpu-ly token string for a single note (pitch, octave marker, duration).
 
     A note carrying ``chord_notes`` (合音) is emitted in jianpu-ly's simple-chord
@@ -437,10 +547,33 @@ def jianpu_note_token(note: JianpuNote) -> str:
     else:
         base_note = note.accidental + note.symbol + jianpu_octave_symbol(note.upper_dots, note.lower_dots)
 
+    # Per-pitch ties (合音里只连其中某几个音) are encoded as an ``@PT`` suffix.
+    # jianpu-ly strips ``@PT…`` off the end of the word *before* parsing the note,
+    # so the suffix must sit after the dots/prefix that spell the duration —
+    # ``q#1'#4'.@PT1e1``, never ``q#1'#4'@PT1e1.`` (the trailing dot would be
+    # swallowed into the tie spec and rejected as an invalid pitch tie).
+    pt_suffix = ''
+    if (note.pitch_tie_starts or note.pitch_tie_stops
+            or note.pitch_tie_carry_in or note.pitch_tie_carry_out):
+        markers = ([f'{index}e{tie_id}' for index, tie_id in note.pitch_tie_stops]
+                   + [f'{index}s{tie_id}' for index, tie_id in note.pitch_tie_starts]
+                   + [f'{index}i{tie_id}' for index, tie_id in note.pitch_tie_carry_in]
+                   + [f'{index}o{tie_id}' for index, tie_id in note.pitch_tie_carry_out])
+        pt_suffix = '@PT' + ','.join(markers)
+
+    if getattr(note, 'is_grace', False):
+        return f'g[{base_note}{pt_suffix}]'
+
     tol = 0.01
-    d = note.duration
+    d = note.written_duration if note.written_duration is not None else note.duration
 
     if note.is_rest:
+        if abs(d - 8.0) < tol:
+            return '0 - - - - - - -'
+        if abs(d - 6.0) < tol:
+            return '0 - - - - -'
+        if abs(d - 5.0) < tol:
+            return '0 - - - -'
         if abs(d - 4.0) < tol:
             return '0 - - -'
         if abs(d - 3.0) < tol:
@@ -463,31 +596,70 @@ def jianpu_note_token(note: JianpuNote) -> str:
             return 'd0.'
         if abs(d - 0.125) < tol:
             return 'd0'
+        if abs(d - 0.09375) < tol:
+            return 'h0.'
+        if abs(d - 0.0625) < tol:
+            return 'h0'
         return '0'
 
+    if abs(d - 8.0) < tol:
+        return f'{base_note}{pt_suffix} - - - - - - -'
+    if abs(d - 6.0) < tol:
+        return f'{base_note}{pt_suffix} - - - - -'
+    if abs(d - 5.0) < tol:
+        return f'{base_note}{pt_suffix} - - - -'
     if abs(d - 4.0) < tol:
-        return f'{base_note} - - -'
+        return f'{base_note}{pt_suffix} - - -'
     if abs(d - 3.0) < tol:
-        return f'{base_note} - -'
+        return f'{base_note}{pt_suffix} - -'
     if abs(d - 2.0) < tol:
-        return f'{base_note} -'
+        return f'{base_note}{pt_suffix} -'
     if abs(d - 1.5) < tol:
-        return f'{base_note}.'
+        return f'{base_note}.{pt_suffix}'
     if abs(d - 1.0) < tol:
-        return base_note
+        return f'{base_note}{pt_suffix}'
     if abs(d - 0.75) < tol:
-        return f'q{base_note}.'
+        return f'q{base_note}.{pt_suffix}'
     if abs(d - 0.5) < tol:
-        return f'q{base_note}'
+        return f'q{base_note}{pt_suffix}'
     if abs(d - 0.375) < tol:
-        return f's{base_note}.'
+        return f's{base_note}.{pt_suffix}'
     if abs(d - 0.25) < tol:
-        return f's{base_note}'
+        return f's{base_note}{pt_suffix}'
     if abs(d - 0.1875) < tol:
-        return f'd{base_note}.'
+        return f'd{base_note}.{pt_suffix}'
     if abs(d - 0.125) < tol:
-        return f'd{base_note}'
-    return f'q{base_note}'
+        return f'd{base_note}{pt_suffix}'
+    if abs(d - 0.09375) < tol:
+        return f'h{base_note}.{pt_suffix}'
+    if abs(d - 0.0625) < tol:
+        return f'h{base_note}{pt_suffix}'
+    return f'q{base_note}{pt_suffix}'
+
+
+def jianpu_note_token(note: JianpuNote) -> str:
+    """Format an event and its explicit slur boundaries for jianpu-ly."""
+    token = _jianpu_note_token_unmarked(note)
+    if note.notations:
+        if note.is_grace:
+            # Keep these post-events inside the preceding single-note grace
+            # group rather than accidentally attaching them to the main note.
+            token += ' ' + ' '.join('GraceMark:' + mark for mark in note.notations)
+        else:
+            # A long note expands to "1 - -"; attach to its first event.
+            words = token.split()
+            words[1:1] = list(note.notations)
+            token = ' '.join(words)
+    prefix = ''
+    if note.tuplet_start:
+        power = 1 << (note.tuplet_actual - 1).bit_length()
+        default_normal = note.tuplet_actual * 3 // 2 if power == note.tuplet_actual else power // 2
+        ratio = (str(note.tuplet_actual) if note.tuplet_normal == default_normal
+                 else f'{note.tuplet_actual}:{note.tuplet_normal}')
+        prefix = f'{ratio}[ '
+    suffix = ' ]' if note.tuplet_stop else ''
+    return (prefix + token + ' (' * note.slur_carry_in + ' )' * note.slur_stops
+            + ' (' * note.slur_starts + ' )' * note.slur_carry_out + suffix)
 
 
 def normalize_jianpu_duration(duration: float) -> float:
@@ -496,12 +668,12 @@ def normalize_jianpu_duration(duration: float) -> float:
     for candidate in ALLOWED_JIANPU_DURATIONS:
         if duration + tol >= candidate:
             return candidate
-    return 0.125
+    return 0.0625
 
 
 def infer_duration_dots(duration: float) -> int:
     """Return 1 if the duration matches a dotted note value, otherwise 0."""
-    for candidate in (1.5, 0.75, 0.375, 0.1875):
+    for candidate in (1.5, 0.75, 0.375, 0.1875, 0.09375):
         if abs(duration - candidate) < 0.01:
             return 1
     return 0
@@ -521,6 +693,14 @@ def jianpu_note_units(note: JianpuNote) -> int:
     that ``jianpu_note_token`` and this function agree for every allowed
     duration.
     """
+    if getattr(note, 'is_grace', False):
+        return 0
+    if note.tuplet_actual and note.tuplet_normal:
+        written = note.written_duration if note.written_duration is not None else note.duration
+        for candidate, units in _TOKEN_UNITS:
+            if abs(written - candidate) < 0.01:
+                return units * Fraction(note.tuplet_normal, note.tuplet_actual)
+        return (16 if note.is_rest else 8) * Fraction(note.tuplet_normal, note.tuplet_actual)
     tol = 0.01
     d = note.duration
     if note.is_rest:
@@ -555,6 +735,21 @@ def clone_jianpu_note(note: JianpuNote, duration: float, carry_lyrics: bool = Tr
         is_rest=note.is_rest,
         lyrics=note.lyrics if carry_lyrics else {},
         chord_notes=getattr(note, 'chord_notes', ()),
+        is_grace=getattr(note, 'is_grace', False),
+        slur_starts=getattr(note, 'slur_starts', 0),
+        slur_stops=getattr(note, 'slur_stops', 0),
+        written_duration=note.written_duration,
+        tuplet_actual=note.tuplet_actual,
+        tuplet_normal=note.tuplet_normal,
+        tuplet_type=note.tuplet_type,
+        tuplet_start=note.tuplet_start,
+        tuplet_stop=note.tuplet_stop,
+        notations=note.notations if carry_lyrics else (),
+        tie_review=note.tie_review if carry_lyrics else '',
+        pitch_tie_starts=list(note.pitch_tie_starts) if carry_lyrics else [],
+        pitch_tie_stops=list(note.pitch_tie_stops) if carry_lyrics else [],
+        pitch_tie_carry_in=list(note.pitch_tie_carry_in) if carry_lyrics else [],
+        pitch_tie_carry_out=list(note.pitch_tie_carry_out) if carry_lyrics else [],
     )
 
 
@@ -583,18 +778,18 @@ def split_duration_chunks(duration: float) -> list[float]:
 
 # jianpu-ly.py sets barLength = int(64 * num / denom) and uses integer Fraction arithmetic.
 # Map each allowed quarter-length duration to its 64th-note unit count.
-_DURATION_TO_UNITS: dict[float, int] = {
-    4.0: 64, 3.0: 48, 2.0: 32, 1.5: 24, 1.0: 16,
-    0.75: 12, 0.5: 8, 0.375: 6, 0.25: 4, 0.1875: 3, 0.125: 2,
+_DURATION_TO_UNITS: dict[float, int | Fraction] = {
+    8.0: 128, 6.0: 96, 5.0: 80, 4.0: 64, 3.0: 48, 2.0: 32, 1.5: 24, 1.0: 16,
+    0.75: 12, 0.5: 8, 0.375: 6, 0.25: 4, 0.1875: 3, 0.125: 2, 0.09375: Fraction(3, 2), 0.0625: 1,
 }
-_ALLOWED_UNITS_DESC: list[tuple[int, float]] = sorted(
+_ALLOWED_UNITS_DESC: list[tuple[int | Fraction, float]] = sorted(
     ((u, d) for d, u in _DURATION_TO_UNITS.items()), reverse=True
 )  # [(64, 4.0), (48, 3.0), ..., (2, 0.125)]
 
 # Quarter-length → units, in the same descending order and with the same 0.01
 # tolerance that ``jianpu_note_token`` matches on; ``jianpu_note_units`` reads
 # this table so the two can never disagree about how long a token is.
-_TOKEN_UNITS: tuple[tuple[float, int], ...] = tuple(
+_TOKEN_UNITS: tuple[tuple[float, int | Fraction], ...] = tuple(
     (d, u) for d, u in sorted(_DURATION_TO_UNITS.items(), reverse=True)
 )
 

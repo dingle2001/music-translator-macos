@@ -1,5 +1,7 @@
 # 状态清单：已完成 / 未验证 / 阻塞 / 下一步
 
+此页记录 2026-10-25 的初版移植。当前分支的运行方式和验收范围见 [macOS 安装与使用](macos_setup.md)。
+
 - 更新：2026-10-25
 - 分支：`feature/macos-apple-silicon`（基于 `master@a0c9372`）
 - 机器：Apple Silicon arm64 / macOS 27.0.1

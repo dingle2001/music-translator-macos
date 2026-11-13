@@ -242,36 +242,24 @@ def _major_key_from_fifths(fifths: int) -> str:
 
 def _parse_musicxml_key_signature(mxl_path: Path) -> Optional[str]:
     try:
-        import zipfile
-        if mxl_path.suffix.lower() == '.mxl':
-            with zipfile.ZipFile(mxl_path, 'r') as z:
-                xml_names = [n for n in z.namelist() if n.lower().endswith('.xml')]
-                if not xml_names:
-                    return None
-                text = z.read(xml_names[0]).decode('utf-8', errors='ignore')
-        else:
-            text = mxl_path.read_text(encoding='utf-8', errors='ignore')
-        import xml.etree.ElementTree as ET
-        root = ET.fromstring(text)
+        from .musicxml_wedges import read_musicxml_bytes
+
+        root = ET.fromstring(read_musicxml_bytes(mxl_path))
         ns = ''
         if root.tag.startswith('{'):
             ns = root.tag.split('}')[0] + '}'
-        attributes = root.find(f'.//{ns}attributes')
-        if attributes is None:
-            return None
-        key_elem = attributes.find(f'{ns}key')
+        key_elem = root.find(f'.//{ns}attributes/{ns}key')
         if key_elem is None:
             return None
         fifths_elem = key_elem.find(f'{ns}fifths')
         if fifths_elem is None or fifths_elem.text is None:
             return None
         fifths = int(fifths_elem.text.strip())
-        # <mode>（大调/小调）在此有意忽略——不是漏写小调逻辑：本函数唯一
-        # 消费方是移调页的"自动检测原调"，而 XML 级移调只做半音平移（改
-        # <pitch> 与 <fifths>），mode 不参与音程计算。a 小调按其关系大调 C
-        # 报告，from→to 半音差与按真实小调主音计算完全一致，仅显示名不同。
-        # jianpu 提取侧需要 mode 的地方由 primitives._get_score_key_tonic
-        # 单独正确处理（小调输出 '6=X' 头）。
+        mode = key_elem.findtext(f'{ns}mode')
+        if mode == 'minor':
+            from music21.key import KeySignature
+
+            return KeySignature(fifths).asKey('minor').tonic.name.replace('-', 'b')
         return _major_key_from_fifths(fifths)
     except Exception:
         return None

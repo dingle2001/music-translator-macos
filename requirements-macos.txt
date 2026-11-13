@@ -16,6 +16,8 @@ joblib==1.6.0
 jsonpickle==4.1.4
 kiwisolver==1.5.1
 matplotlib==3.11.2
+markdown-it-py==4.3.0
+mdurl==0.1.2
 more-itertools==11.2.1
 music21==10.5.1
 musicxml==1.4
@@ -29,6 +31,7 @@ pillow==12.3.0
 protobuf==7.36.2
 psutil==7.2.2
 pyclipper==1.4.0
+pygments==2.21.0
 pymupdf==2.0
 pymupdf-layout==2.0
 pymupdf4llm==2.0
@@ -38,6 +41,7 @@ pyyaml==6.0.3
 rapidocr==3.10.0
 reportlab==5.1.0
 requests==2.34.2
+rich==15.0.0
 shapely==2.2.0
 six==1.17.0
 tabulate==0.10.0

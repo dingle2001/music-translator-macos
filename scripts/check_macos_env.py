@@ -62,6 +62,7 @@ def _check_packages() -> None:
         ('homr', (0, 7), 'OMR 推理'),
         ('onnxruntime', (1, 24), 'ONNX 推理后端'),
         ('PIL', (10, 0), '图像处理'),
+        ('rich', (13, 0), '终端校对界面'),
     ]:
         try:
             m = __import__(mod)
@@ -169,15 +170,19 @@ def _check_lilypond() -> None:
 
 
 def _check_misc() -> None:
+    sys.path.insert(0, str(REPO))
+    from core.app.runtime_finder import find_audiveris_executable
+
     font = Path('/Library/Fonts/Arial Unicode.ttf')
     if font.exists():
         ok('Arial Unicode', f'{font} 存在（jianpu-ly 的 macOS 字体回退会生效，2.26 已自动跳过）')
     else:
         ok('Arial Unicode', '不存在（不需要字体回退）')
-    if shutil.which('waifu2x-ncnn-vulkan'):
-        ok('waifu2x', '可用（低分辨率扫描件超分）')
+    audiveris = find_audiveris_executable()
+    if audiveris:
+        ok('Audiveris', str(audiveris))
     else:
-        warn('waifu2x', '不可用：矢量 PDF 不受影响；低分辨率扫描件识别质量会下降')
+        warn('Audiveris', '可选引擎未安装，安装说明见 docs/macos_setup.md')
     sample = REPO / 'tests' / 'fixtures' / 'sheng.pdf'
     ok('测试样本', f'{sample.name} 存在' if sample.exists() else '缺少 tests/fixtures 样本')
 
