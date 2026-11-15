@@ -2,7 +2,7 @@
   <img src="assets/social-preview.png" alt="music_translator：五线谱 PDF 转简谱" width="100%">
 </p>
 
-<h1 align="center">music_translator</h1>
+<h1 align="center">Music Translator for macOS</h1>
 
 <p align="center">
   <em>五线谱 PDF → 简谱 —— 既能出整页简谱，也能把简谱<b>直接贴回原谱每一行五线谱的下方</b>。</em>
@@ -28,6 +28,16 @@
 </p>
 
 ---
+
+## 项目来源
+
+这是 [starpacker/music_translator](https://github.com/starpacker/music_translator) 的 macOS 适配版，保留上游的五线谱识别、整页简谱与原位对照流程，并提供 Apple Silicon 上的原生应用、Core ML 加速和 Agent 辅助校谱接口。想了解原有转换流程及其维护进展，可前往 [直接上游仓库](https://github.com/starpacker/music_translator)。
+
+starpacker 的项目沿用了更早的五线谱转简谱工作。感谢 [xuxiran/translate-staff-to-simple-musical-notation](https://github.com/xuxiran/translate-staff-to-simple-musical-notation) 的 Xu Xiran、Ying Jiahe，以及 starpacker 和各依赖项目的贡献者。早期模板匹配实现可从 [xuxiran 的原始项目](https://github.com/xuxiran/translate-staff-to-simple-musical-notation) 查阅。
+
+**Mac 环境**：Apple Silicon（M 系列，arm64）、macOS 14 或更新版本、原生 Python 3.11 和 LilyPond 2.26（arm64）。构建原生应用需要 Xcode Command Line Tools。建议为常规转换预留至少 3 GB 可用磁盘空间。安装依赖与首次下载识谱模型需要联网。详见 [安装与硬件要求](docs/macos_setup.md)。
+
+**Agent 辅助校谱**：通过本地 MCP 读取指定页的原谱图、MusicXML 摘录和本地告警。支持 Codex 及能启动 stdio MCP 并读取图像结果的客户端。见 [接入与复验指南](docs/agent_review.md)。
 
 ## ✨ 这是什么
 
@@ -151,8 +161,8 @@ Apple Silicon 用户可按 [macOS 安装与使用](docs/macos_setup.md) 配置�
 ### 1. 本项目 + Python 环境
 
 ```bash
-git clone https://github.com/starpacker/music_translator.git
-cd music_translator
+git clone https://github.com/dingle2001/music-translator-macos.git
+cd music-translator-macos
 
 python -m venv .venv && source .venv/bin/activate      # 建议 Python 3.10+
 pip install -r requirements.txt
@@ -439,6 +449,8 @@ python jianpu.py 曲笛.pdf --mode jianpu -o out/曲笛-简谱.pdf
 | `--transpose SEMITONES` / `--transpose-to NOTE` | 实际移调，派生 MusicXML 写入工作目录 |
 | `--melody-only` | 钢琴音频只提取主旋律 |
 | `--no-vector-slurs` | 跳过「从 PDF 连奏线重建 slur」，改用 MusicXML 原有标记 |
+
+可在 Codex 中通过本地 MCP 按页校对已转换的分谱。见 [Agent 辅助校谱](docs/agent_review.md)。
 
 ---
 

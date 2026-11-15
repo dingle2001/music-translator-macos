@@ -1,9 +1,8 @@
 # Apple Silicon 安装与使用
 
-在 macOS 27.2.1、arm64、Python 3.11.17、LilyPond 2.26.0 上完成验证。当前工作区已经配置好，双击 `output/五线谱转简谱.app` 可打开原生转换窗口。应用使用构建时记录的源码目录和本机运行环境，移动源码目录后请重新构建。
+实测环境为 macOS 27.2.1、Apple Silicon、Python 3.11.17 和 LilyPond 2.26.0。完成下文安装后，从仓库目录构建并双击 `../output/五线谱转简谱.app` 打开应用。应用使用构建时记录的源码目录和本机运行环境，移动源码目录后请重新构建。
 
 ```bash
-cd music_translator
 source scripts/env.sh
 python scripts/check_macos_env.py
 bash macos/build.sh
@@ -13,11 +12,14 @@ bash macos/build.sh
 
 | 组件 | 要求 | 检查命令 |
 |---|---|---|
-| 芯片 | Apple Silicon（arm64） | `uname -m` → `arm64` |
-| 系统 | macOS 14+（本机 27.0.1） | `sw_vers` |
-| 命令行工具 | Xcode Command Line Tools | `xcode-select -p` |
-| 磁盘 | ≥ 3 GB（venv 约 600 MB + 模型 160 MB + Core ML 缓存可选 240 MB） | `df -h .` |
-| 网络 | 首次需下载 Python / 模型 / LilyPond（约 320 MB） | — |
+| 芯片 | Apple Silicon M 系列（arm64），Intel Mac 未验证 | `uname -m` → `arm64` |
+| 系统 | 原生应用的构建目标为 macOS 14+，实测 macOS 27.2.1 | `sw_vers` |
+| Python | 原生 arm64 Python 3.11 | `python -V` |
+| 排版 | LilyPond 2.26 原生 arm64 | `lilypond --version` |
+| 命令行工具 | 构建应用需要 Xcode Command Line Tools（含 Swift） | `xcode-select -p` |
+| 磁盘 | 常规转换建议至少 3 GB 可用空间，用于依赖、模型、缓存和产物；音频模型另计 | `df -h .` |
+| 内存 | 未验证统一的最低内存，所需内存随识谱后端、页图尺寸和乐谱复杂度而变化 | — |
+| 网络 | 安装依赖与首次下载模型需要联网；资源就绪后可本地转换 | — |
 
 没装 CLT 时：
 
@@ -55,7 +57,6 @@ export UV_PYTHON_INSTALL_DIR="$PWD/.toolchain/python"
 ### 建 venv
 
 ```bash
-cd music_translator
 "$(uv python find 3.11 2>/dev/null || command -v python3.11)" -m venv .venv
 source .venv/bin/activate
 python -V          # 必须显示 3.11.x
@@ -81,7 +82,8 @@ Homr 使用 ONNX Runtime。Audiveris 使用官方 Mac 应用内的 Java。
 macOS arm64 的官方构建从 **2.26.0** 开始。下载的是 `.tar.gz`，解压即可用，不写 `/Applications`、不需要管理员：
 
 ```bash
-cd <工作目录>
+# 从仓库目录进入其父目录，安装到 scripts/env.sh 会查找的位置。
+cd ..
 mkdir -p .toolchain/downloads .toolchain/lilypond
 # https://gitlab.com/lilypond/lilypond/-/releases/v2.26.0
 curl -fL -o .toolchain/downloads/lilypond-2.26.0-darwin-arm64.tar.gz \
@@ -91,7 +93,7 @@ tar -xzf .toolchain/downloads/lilypond-2.26.0-darwin-arm64.tar.gz \
 .toolchain/lilypond/bin/lilypond --version    # GNU LilyPond 2.26.0 (running Guile 3.0)
 ```
 
-运行时把它放进 `PATH`（脚手架脚本已代为处理）：
+返回仓库目录。运行时把它放进 `PATH`（`scripts/env.sh` 已代为处理）：
 
 ```bash
 export PATH="$PWD/../.toolchain/lilypond/bin:$PATH"
@@ -155,6 +157,10 @@ python batch.py /path/to/pdf-folder --strict -o ../output/批量 --zip ../output
 `--transpose-to D` 或 `--transpose 2` 改变实际音高，派生 MusicXML 保存在工作目录。固定调只改变简谱的唱名参考。移调后原位 PDF 的五线谱保留源谱。简谱文本可用 `python -m core.app.tui` 的「打开简谱编辑器」校对和重排，TUI 从仓库的 `editor-workspace` 读取。
 
 Mac 窗口也能打开生成的 `.jianpu.txt`，交给文本编辑修改，再点击「开始转换」重新排版。命令行对应 `python jianpu.py 已校对.jianpu.txt --mode jianpu`。
+
+### Agent 辅助校谱
+
+转换完成后可用本地 MCP 把指定页的原谱图、MusicXML 摘录和疑点交给 Codex 或其他 Agent。见 [Agent 校谱接入](agent_review.md)。
 
 ### Audiveris
 
@@ -233,6 +239,6 @@ python -m unittest discover -s tests -v
 
 ## 10. 验收范围
 
-本机已验证 PDF 和图像识谱、MusicXML/MXL 导入、整页和原位排版、移调、MIDI、批量 ZIP、校对文本、钢琴 MP3 转录及 Mac 窗口导出。样谱报告保存在工作区的 `output/macos-parity`、`output/秦兵马俑` 和 `.work`。
+本机已验证 PDF 和图像识谱、MusicXML/MXL 导入、整页和原位排版、移调、MIDI、批量 ZIP、校对文本、钢琴 MP3 转录及 Mac 窗口导出。本地 MCP 已在 Codex 中验证逐页返回原谱图和对应 MusicXML。
 
-macOS 交付为依赖本地源码与运行环境的 arm64 应用。独立安装包、公证、Kimi 等多模态校谱、简谱与五线谱同步编辑和完整的人工逐音准确率仍待实现或验收。
+macOS 交付为依赖本地源码与运行环境的 arm64 应用。独立安装包、公证、简谱与五线谱同步编辑和完整的人工逐音准确率仍待实现或验收。

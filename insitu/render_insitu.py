@@ -1000,7 +1000,7 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
     # Never leave a previous success report beside an interrupted regeneration.
     _write_json_report(report_path, {'status': 'in_progress',
                                      'scope': 'in_situ_rendering_not_omr_accuracy',
-                                     'source_pdf': str(pdf_path), 'source_musicxml': str(mxl_path),
+                                     'source_pdf': str(pdf_path.resolve()), 'source_musicxml': str(mxl_path.resolve()),
                                      'output_pdf': str(out_path), 'layout': layout})
     staves, slices = align_from_files(pdf_path, mxl_path)
     score = parse_musicxml_compatible(mxl_path)
@@ -1222,8 +1222,8 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
         return hasher.hexdigest()
 
     report = {'status': status, 'scope': 'in_situ_rendering_not_omr_accuracy',
-              'source_pdf': str(pdf_path), 'source_pdf_sha256': digest(pdf_path),
-              'source_musicxml': str(mxl_path), 'source_musicxml_sha256': digest(mxl_path),
+              'source_pdf': str(pdf_path.resolve()), 'source_pdf_sha256': digest(pdf_path),
+              'source_musicxml': str(mxl_path.resolve()), 'source_musicxml_sha256': digest(mxl_path),
               'output_pdf': str(out_path), 'output_pdf_sha256': digest(out_path),
               'engine': 'spaced' if expand else 'stamp', 'layout': layout, 'pitch_mode': pitch_mode,
               'source_page_count': len({p['source_page'] for p in page_map}),

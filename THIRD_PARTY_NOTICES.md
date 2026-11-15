@@ -3,6 +3,11 @@
 本项目以 **AGPL-3.0** 发布（见 `LICENSE`）。本次包含 SumisoraOMR 的核心源码与 jianpu-ly 预处理器，其余组件由环境安装；
 此处列出它们的许可与用途，以满足署名与许可提示的要求。
 
+## 项目沿革
+
+- [starpacker/music_translator](https://github.com/starpacker/music_translator)（AGPL-3.0）是此 macOS 适配版的直接上游，提供五线谱识别、简谱转换和原位对照管线。
+- 感谢 Xu Xiran 和 Ying Jiahe 的 [translate-staff-to-simple-musical-notation](https://github.com/xuxiran/translate-staff-to-simple-musical-notation)（GPL-3.0），这是直接上游项目所沿用的早期五线谱转简谱工作。原始识谱与模板匹配实现见该独立仓库。
+
 ## 运行期核心
 
 | 组件 | 版本 | 许可 | 用途 |

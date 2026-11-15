@@ -31,6 +31,7 @@ final class ConversionState: ObservableObject {
     @Published var editor = false
     @Published var transpose = ""
     @Published var melodyOnly = false
+    @Published var codexReview: [String: String]? = nil
     @Published var running = false
     @Published var status = "请选择乐谱"
     @Published var log = ""
@@ -150,6 +151,9 @@ struct ConverterView: View {
                 if model.running { ProgressView().controlSize(.small) }
                 Text(model.status).lineLimit(2)
                 Spacer()
+                if let parameters = model.codexReview {
+                    Button("复制 Codex 校谱指令") { copyCodexPrompt(parameters) }
+                }
                 if let logFile = model.logFile {
                     Button("打开完整日志") { NSWorkspace.shared.open(logFile) }
                 }
@@ -184,6 +188,7 @@ struct ConverterView: View {
         model.source = selected
         model.batch = directory
         model.musicXML = nil
+        model.codexReview = nil
         model.mode = directory || selected.pathExtension.lowercased() == "pdf" ? "both" : "jianpu"
         model.status = "可以开始转换"
     }
@@ -205,7 +210,6 @@ struct ConverterView: View {
                     "--fixed-tonic", model.tonic,
                     "--omr", model.omr, "--backend", model.backend]
         if model.strict { args.append("--strict") }
-
         do {
             if model.batch {
                 args += ["-o", model.output.path]
@@ -242,6 +246,7 @@ struct ConverterView: View {
             process.standardOutput = handle
             process.standardError = handle
             model.running = true
+            model.codexReview = nil
             model.status = "正在转换 " + source.lastPathComponent
             model.log = ""
             try process.run()
@@ -253,14 +258,35 @@ struct ConverterView: View {
                 }
                 updateLog(path)
                 model.running = false
-                model.status = process.terminationStatus == 0
-                    ? (hasReport ? "已生成。原位排版和识谱疑点见输出报告。" : "已生成简谱 PDF。")
-                    : "转换未完成，请查看日志。"
+                if process.terminationStatus == 0,
+                   let line = model.log.split(separator: "\n").last(where: { $0.hasPrefix("[codex] ") }) {
+                    model.codexReview = try? JSONDecoder().decode(
+                        [String: String].self, from: Data(line.dropFirst("[codex] ".count).utf8))
+                }
+                if process.terminationStatus != 0 {
+                    model.status = "转换未完成，请查看日志。"
+                } else {
+                    model.status = hasReport ? "已生成。原位排版和识谱疑点见输出报告。" : "已生成简谱 PDF。"
+                }
             }
         } catch {
             model.running = false
             model.status = error.localizedDescription
         }
+    }
+
+    private func copyCodexPrompt(_ parameters: [String: String]) {
+        let inputs = parameters.sorted { $0.key < $1.key }
+            .map { "\($0.key) = \($0.value)" }
+            .joined(separator: "\n")
+        let prompt = """
+        请用 music-translator MCP 的 review_score_page 校对这份分谱，先看原 PDF 第 1 页，再根据疑点复查其他页。
+        请按原谱页码、谱行和 MusicXML 小节索引列出证据和建议。
+        \(inputs)
+        """
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(prompt, forType: .string)
+        model.status = "已复制，请粘贴到 Codex。"
     }
 
     private func updateLog(_ path: URL) {

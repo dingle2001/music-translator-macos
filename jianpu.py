@@ -655,6 +655,7 @@ def main(argv: list[str]) -> int:
     if is_pdf and not args.no_vector_wedges and args.mode in ('jianpu', 'both'):
         jianpu_mxl = recover_pdf_wedges(score, mxl, jianpu_mxl, work, base.name)
 
+    review_mxl = jianpu_mxl
     if args.transpose is not None or args.transpose_to is not None:
         from core.notation.transposer import detect_key_from_musicxml, get_transposition_semitones, transpose_musicxml
 
@@ -692,6 +693,14 @@ def main(argv: list[str]) -> int:
             if report['status'] == 'incomplete':
                 print('[insitu] 原位输出不完整，请查看逐行报告。', file=sys.stderr)
                 return 1
+    if is_pdf:
+        parameters = {
+            'pdf_path': str(score.resolve()),
+            'musicxml_path': str(review_mxl.resolve()),
+        }
+        if args.mode in ('insitu', 'both') and review_mxl == mxl:
+            parameters['report_path'] = str(out.with_suffix('.report.json').resolve())
+        print('[codex] ' + json.dumps(parameters, ensure_ascii=False))
     return 0
 
 
