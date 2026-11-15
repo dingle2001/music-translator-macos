@@ -3,6 +3,7 @@
 
 import logging
 import os
+import platform
 import shutil
 import sys
 import threading
@@ -13,12 +14,22 @@ from typing import Optional
 
 from ..config import HOMR_SOURCE_DIR_NAME, MAX_HOMR_SECONDS, OMR_ENGINE_DIR_NAME
 from ..utils import find_first_musicxml_file, get_app_base_dir, log_message, safe_remove_file
+from .apple_coreml import (
+    BACKEND_CHOICES, COMPUTE_UNITS, COREML_MODES, PROVIDER as COREML_PROVIDER,
+    AppleInferenceRun, install_coreml_hooks,
+)
 
 _PATH_LOCK = threading.Lock()
 
 
 def _get_available_memory_mb() -> Optional[int]:
-    """Return the available physical memory in MB (Windows only; other platforms return None)."""
+    """Return available physical memory in MiB on macOS and Windows."""
+    if sys.platform == 'darwin':
+        try:
+            import psutil
+            return psutil.virtual_memory().available // (1024 * 1024)
+        except (ImportError, OSError):
+            return None
     if os.name != 'nt':
         return None
     try:
@@ -98,6 +109,18 @@ def _compute_segnet_batch_size(avail_mb: Optional[int]) -> int:
     内存越少，每批处理的 patch 越少，降低内存峰值。
     阈值经验来自：模型权重 ~150 MB + ONNX 运行时开销 ~200 MB + 批量 numpy 缓冲。
     """
+    if sys.platform == 'darwin':
+        batch_override = os.environ.get('HOMR_SEGNET_BATCH_SIZE')
+        if batch_override in ('1', '2', '4', '8'):
+            return int(batch_override)
+        # Leave space for the system and the recognition models on 8 GB Macs.
+        try:
+            memory_bytes = os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE')
+            small_mac = 0 < memory_bytes <= 8 * 1024**3
+        except (ValueError, OSError):
+            small_mac = False
+        if small_mac:
+            avail_mb = min(avail_mb, 2999) if avail_mb is not None else 2999
     if avail_mb is None:
         return 8  # 无法检测，使用默认值
     if avail_mb >= 3000:
@@ -402,7 +425,7 @@ def _log_homr_gpu_mode() -> None:
         elif 'DmlExecutionProvider' in _avail:
             log_message('[homr] GPU: DirectML（DmlExecutionProvider 可用，将尝试集显/独显加速）。')
         elif 'CoreMLExecutionProvider' in _avail:
-            log_message('[homr] GPU: CoreMLExecutionProvider 可用（Apple Silicon，segnet+encoder）。')
+            log_message('[homr] Core ML 执行提供程序可用。')
         else:
             log_message('[homr] GPU: CUDA / DirectML / CoreML 不可用，将使用 CPU 推理。')
     except Exception:
@@ -422,9 +445,6 @@ def _homr_gpu_available() -> bool:
 #   * transformer encoder：需要显式 coreml_encoder=True，且必须用 fp16 权重；
 #   * transformer decoder：CoreML EP 跑不了（动态 KV-cache），始终留在 CPU fp32。
 # 因此 macOS 上「开 CoreML」不能简单等同于「把 transformer_use_gpu 设为 True」。
-BACKEND_CHOICES = ('auto', 'cpu', 'coreml', 'cuda')
-
-
 def _available_providers() -> set[str]:
     """Available ONNX Runtime execution providers; empty when ORT is absent."""
     try:
@@ -434,32 +454,39 @@ def _available_providers() -> set[str]:
         return set()
 
 
-def _resolve_inference_backend(requested: Optional[str] = None) -> dict:
+def _resolve_inference_backend(requested: Optional[str] = None, *,
+                               available_memory_mb: Optional[int] = None) -> dict:
     """Map a backend name (or $HOMR_BACKEND) to concrete homr flags.
 
-    Returns ``{'name', 'segnet_gpu', 'transformer_gpu', 'coreml_encoder', 'label'}``.
-    An unavailable backend silently degrades to CPU, and the returned ``name``
-    is what actually runs — callers must log/report that, never the request.
+    Returns the resolved provider and stage settings. A missing provider uses CPU.
     """
     backend = (requested or os.environ.get('HOMR_BACKEND') or 'auto').strip().lower()
     if backend not in BACKEND_CHOICES:
         backend = 'auto'
     providers = _available_providers()
     has_cuda = bool({'CUDAExecutionProvider', 'DmlExecutionProvider'} & providers)
-    has_coreml = 'CoreMLExecutionProvider' in providers
+    has_coreml = COREML_PROVIDER in providers
+    apple_silicon = sys.platform != 'darwin' or platform.machine() == 'arm64'
 
     if backend == 'auto':
-        # Apple Silicon: default to Core ML so acceleration works out of the box
-        # (product decision, 2026-10-25).  Measured: still slower than the CPU EP
-        # on our samples (8.6 s vs 4.9 s for a page, see docs/coreml_plan.md), so
-        # `--backend cpu` / $HOMR_BACKEND=cpu stays the documented fast path.
-        backend = 'cuda' if has_cuda else ('coreml' if has_coreml else 'cpu')
+        if sys.platform == 'darwin' and available_memory_mb is None:
+            available_memory_mb = _get_available_memory_mb()
+        low_memory = (sys.platform == 'darwin' and available_memory_mb is not None
+                      and available_memory_mb < 2000)
+        if has_coreml and apple_silicon and low_memory:
+            log_message(f'[homr] 可用内存 {available_memory_mb} MiB，自动选择 CPU。')
+        backend = 'cuda' if has_cuda else (
+            'coreml' if has_coreml and apple_silicon and not low_memory else 'cpu')
     if backend == 'cuda' and not has_cuda:
         backend = 'cpu'
-    if backend == 'coreml' and not has_coreml:
+    if backend in ('coreml', *COREML_MODES) and not has_coreml:
+        log_message(f'[homr] 请求 {backend}，但 Core ML 不可用，切换到 CPU。', logging.WARNING)
+        backend = 'cpu'
+    if backend == 'coreml-ane' and not apple_silicon:
+        log_message('[homr] 此 Mac 不支持 Apple 神经网络引擎，切换到 CPU。', logging.WARNING)
         backend = 'cpu'
 
-    if backend == 'coreml':
+    if backend in ('coreml', *COREML_MODES):
         # The transformer encoder is a separate opt-in even inside homr.  It can
         # be slower than the CPU fp32 encoder on short scores (one Core ML call
         # per staff line), so keep it switchable for measurement/rollback.
@@ -467,10 +494,16 @@ def _resolve_inference_backend(requested: Optional[str] = None) -> dict:
         # ~4 s slower than the CPU encoder on a 5-staff page, so the shipped
         # default accelerates segnet only.  Set HOMR_COREML_ENCODER=1 to opt in.
         encoder_on = os.environ.get('HOMR_COREML_ENCODER', '0').strip() not in ('0', '', 'false')
-        return {'name': 'coreml', 'segnet_gpu': True, 'transformer_gpu': False,
+        units = COREML_MODES.get(backend) or os.environ.get('HOMR_COREML_COMPUTE_UNITS', '').strip()
+        if units not in COMPUTE_UNITS:
+            if units:
+                log_message(f'[homr] Core ML 计算单元 {units!r} 无效，使用 CPUAndGPU。', logging.WARNING)
+            units = 'CPUAndGPU'
+        stages = 'SegNet 与编码器，解码器在 CPU' if encoder_on else 'SegNet，编码器与解码器在 CPU'
+        return {'name': backend, 'segnet_gpu': True, 'transformer_gpu': False,
                 'coreml_encoder': encoder_on,
-                'label': ('CoreML（segnet+encoder，decoder 在 CPU）' if encoder_on
-                          else 'CoreML（仅 segnet，encoder/decoder 在 CPU）')}
+                'compute_units': units,
+                'label': f'Core ML / {units}（{stages}）'}
     if backend == 'cuda':
         return {'name': 'cuda', 'segnet_gpu': True, 'transformer_gpu': True,
                 'coreml_encoder': False, 'label': 'CUDA'}
@@ -479,58 +512,29 @@ def _resolve_inference_backend(requested: Optional[str] = None) -> dict:
 
 
 def _backend_from_flags(use_gpu_inference: Optional[bool],
-                        backend: Optional[str] = None) -> dict:
+                        backend: Optional[str] = None, *,
+                        available_memory_mb: Optional[int] = None) -> dict:
     """Resolve flags for the legacy ``use_gpu_inference`` switch plus ``backend``."""
-    if backend:
-        return _resolve_inference_backend(backend)
-    if use_gpu_inference is False:
-        return _resolve_inference_backend('cpu')
-    if use_gpu_inference is True:
-        return _resolve_inference_backend('auto')
-    return _resolve_inference_backend()
+    if backend is None and use_gpu_inference is not None:
+        backend = 'auto' if use_gpu_inference else 'cpu'
+    return _resolve_inference_backend(backend, available_memory_mb=available_memory_mb)
 
 
-def _install_coreml_compute_units_override() -> None:
-    """Let ``$HOMR_COREML_COMPUTE_UNITS`` override homr's hard-coded choice.
+def _is_acceleration_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(term in message for term in (
+        'cuda', 'coreml', 'core ml', 'dmlexecutionprovider', 'out of memory', 'failed to allocate',
+        'not active after session creation',
+    ))
 
-    homr pins the Core ML MLProgram sessions to ``CPUAndGPU`` (it skips the
-    expensive ANE specialization at session-creation time).  Its own comments
-    note that steady-state batches are *slower* that way and that "ALL" wins when
-    the session lives long enough to amortise the warm-up.  Which one is faster
-    here has to be measured, not assumed, so expose the knob instead of forking
-    homr:
 
-        HOMR_COREML_COMPUTE_UNITS=ALL          # ANE + GPU + CPU (homr default is CPUAndGPU)
-        HOMR_COREML_COMPUTE_UNITS=CPUAndGPU
-        HOMR_COREML_COMPUTE_UNITS=CPUOnly
-
-    No-op unless the variable is set; safe to call repeatedly.
-    """
-    wanted = os.environ.get('HOMR_COREML_COMPUTE_UNITS', '').strip()
-    if not wanted:
-        return
-    try:
-        from homr import onnx_providers  # noqa: PLC0415
-    except Exception:
-        return
-    current = getattr(onnx_providers, 'coreml_mlprogram_providers', None)
-    if current is None or getattr(current, '_dsh_override', False):
-        return
-
-    def coreml_mlprogram_providers(model_path: str, compute_units: str = 'ALL'):
-        return current(model_path, compute_units=wanted)
-
-    coreml_mlprogram_providers._dsh_override = True  # type: ignore[attr-defined]
-    onnx_providers.coreml_mlprogram_providers = coreml_mlprogram_providers
-    # inference_segnet / encoder_inference imported the name by value.
-    for module_name in ('homr.segmentation.inference_segnet', 'homr.transformer.encoder_inference'):
-        try:
-            module = __import__(module_name, fromlist=['x'])
-            if hasattr(module, 'coreml_mlprogram_providers'):
-                module.coreml_mlprogram_providers = coreml_mlprogram_providers
-        except Exception:
-            continue
-    log_message(f'[homr] Core ML compute units 覆盖为 {wanted}（$HOMR_COREML_COMPUTE_UNITS）')
+def _download_cpu_models(homr_main) -> None:
+    _run_with_heartbeat(
+        lambda: homr_main.download_weights(segnet_use_gpu=False, transformer_use_gpu=False, coreml_encoder=False),
+        label='[homr] CPU 回退模型下载',
+        max_seconds=120,
+        heartbeat_message='仍在下载中',
+    )
 
 
 def _preprocess_for_homr(image_path: Path, work_dir: Path) -> Optional[Path]:
@@ -657,22 +661,26 @@ def _run_homr_multipage_pdf(
     total_pages = len(page_png_paths)
     log_message(f'[homr] 多页 PDF，共 {total_pages} 页，逐页识别…')
 
-    _backend = _backend_from_flags(use_gpu_inference, backend)
-    use_gpu_inference = _backend['segnet_gpu']
-    log_message(f'[homr] 推理后端: {_backend["label"]}'
-                + ('' if _backend['name'] != 'cpu' else '（未检测到可用 GPU/ANE provider）'))
-
     _avail_mb = _get_available_memory_mb()
     _batch_size = _compute_segnet_batch_size(_avail_mb)
+    _backend = _backend_from_flags(use_gpu_inference, backend, available_memory_mb=_avail_mb)
+    coreml_run = AppleInferenceRun(_backend.get('compute_units'), os.environ.get('HOMR_COREML_PROFILE') == '1',
+                                    _batch_size if sys.platform == 'darwin' else None)
+    fallback_marker = output_dir / '.cpu-fallback-omr'
+    fallback_marker.unlink(missing_ok=True)
+    use_gpu_inference = _backend['segnet_gpu']
+    log_message(f'[homr] 推理后端: {_backend["label"]}')
+
     if _avail_mb is not None:
-        log_message(f'[homr] 可用内存 {_avail_mb} MB，SegNet 批大小: {_batch_size}。')
+        log_message(f'[homr] 可用内存 {_avail_mb} MiB，SegNet 批大小上限: {_batch_size}。')
 
     # ── 一次性初始化：导入、下载权重 ─────────────────────────────────────────
     source_dir = _ensure_homr_import_path()
     _add_nvidia_cuda_dll_dirs()
     try:
         import homr.main as homr_main  # type: ignore[import-not-found]
-        _install_coreml_compute_units_override()
+        if coreml_run.compute_units or coreml_run.batch_size is not None:
+            install_coreml_hooks()
         _apply_ort_thread_override()  # parallel-batch: cap ONNX threads to this worker's CPU share
         # 与 run_homr_batch 相同：download_weights 只下载缺失权重，弱网下可能长时间挂起。
         # 不能用 ThreadPoolExecutor + result(timeout)（假超时：with 退出阻塞到任务跑完，
@@ -770,32 +778,35 @@ def _run_homr_multipage_pdf(
 
             _captured_image_path = image_path  # 闭包捕获当前页的路径
             _page_ok = False
+            reused_segnet = coreml_run.segnet is not None
             try:
                 _cfg = _make_config(_page_backend)
                 _run_with_heartbeat(
-                    lambda p=_captured_image_path, c=_cfg, x=xml_args: homr_main.process_image(str(p), c, x),
+                    lambda p=_captured_image_path, c=_cfg, run=coreml_run: run.process(
+                        homr_main.process_image, str(p), c, xml_args),
                     label=f'[homr] 第 {page_num}/{total_pages} 页 ',
                     on_heartbeat=_heartbeat_fn,
                 )
                 _page_ok = True
+                if _page_backend.get('compute_units') and coreml_run.segnet is not None:
+                    status = '复用' if reused_segnet else '已启用'
+                    log_message(f'[homr] SegNet {status} Core ML 会话（{coreml_run.compute_units}）。')
                 log_message(f'[homr] 第 {page_num} 页识别完成。')
             except Exception as exc:
-                _exc_str = str(exc)
-                _is_gpu_err = _gpu_mode and (
-                    'cuda' in _exc_str.lower()
-                    or 'coreml' in _exc_str.lower()
-                    or 'CUDAExecutionProvider' in _exc_str
-                    or 'DmlExecutionProvider' in _exc_str
-                    or 'CoreMLExecutionProvider' in _exc_str
-                    or 'not active after session creation' in _exc_str
-                )
-                if _is_gpu_err:
-                    log_message(f'[homr] 第 {page_num} 页 GPU 失败，切换为 CPU 模式（后续页同步切换）…')
+                if isinstance(exc, TimeoutError):
+                    # A timed-out worker can still hold the old I/O binding.
+                    coreml_run = AppleInferenceRun(coreml_run.compute_units, coreml_run.profile, coreml_run.batch_size)
+                if _gpu_mode and _is_acceleration_error(exc):
+                    log_message(f'[homr] 第 {page_num} 页加速失败，后续页切换 CPU：{exc}', logging.WARNING)
+                    fallback_marker.touch()
                     _gpu_mode = False
+                    coreml_run = AppleInferenceRun(batch_size=1 if sys.platform == 'darwin' else None)
                     try:
+                        _download_cpu_models(homr_main)
                         _cpu_cfg = _make_config(_resolve_inference_backend('cpu'))
                         _run_with_heartbeat(
-                            lambda p=_captured_image_path, c=_cpu_cfg, x=xml_args: homr_main.process_image(str(p), c, x),
+                            lambda p=_captured_image_path, c=_cpu_cfg, run=coreml_run: run.process(
+                                homr_main.process_image, str(p), c, xml_args),
                             label=f'[homr] 第 {page_num}/{total_pages} 页(CPU) ',
                             on_heartbeat=_heartbeat_fn,
                         )
@@ -910,7 +921,13 @@ def run_homr_batch(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    _backend = _backend_from_flags(use_gpu_inference, backend)
+    _avail_mb = _get_available_memory_mb()
+    _batch_size = _compute_segnet_batch_size(_avail_mb)
+    _backend = _backend_from_flags(use_gpu_inference, backend, available_memory_mb=_avail_mb)
+    coreml_run = AppleInferenceRun(_backend.get('compute_units'), os.environ.get('HOMR_COREML_PROFILE') == '1',
+                                    _batch_size if sys.platform == 'darwin' else None)
+    fallback_marker = output_dir / '.cpu-fallback-omr'
+    fallback_marker.unlink(missing_ok=True)
     use_gpu_inference = _backend['segnet_gpu']
     log_message(f'[homr] 推理后端: {_backend["label"]}')
 
@@ -938,17 +955,8 @@ def run_homr_batch(
         pass
 
     # ── 内存检测与 batch_size 自适应 ──────────────────────────────────────────
-    _avail_mb = _get_available_memory_mb()
-    _batch_size = _compute_segnet_batch_size(_avail_mb)
     if _avail_mb is not None:
-        if _avail_mb < 1500:
-            log_message(
-                f'[homr] 警告：可用内存仅 {_avail_mb} MB，低于建议的 1.5 GB。'
-                f' SegNet 批大小已自动降至 {_batch_size}，识别可能较慢或失败。',
-                logging.WARNING,
-            )
-        else:
-            log_message(f'[homr] 可用内存 {_avail_mb} MB，SegNet 批大小: {_batch_size}。')
+        log_message(f'[homr] 可用内存 {_avail_mb} MiB，SegNet 批大小上限: {_batch_size}。')
 
     # ── 心跳进度回调（在识别等待期间推进 GUI 进度条）────────────────────────────
     # 将识别阶段进度从 0.10 线性推进到 0.60，基于 MAX_HOMR_SECONDS 做归一化。
@@ -966,7 +974,8 @@ def run_homr_batch(
     _add_nvidia_cuda_dll_dirs()
     try:
         import homr.main as homr_main  # type: ignore[import-not-found]
-        _install_coreml_compute_units_override()
+        if coreml_run.compute_units or coreml_run.batch_size is not None:
+            install_coreml_hooks()
         _apply_ort_thread_override()  # parallel-batch: cap ONNX threads to this worker's CPU share
         # homr.download_weights 只会下载缺失的 ONNX 模型权重。
         # 如果本地已经存在对应 GPU/CPU 模型文件，则不会联网下载。
@@ -1000,33 +1009,28 @@ def run_homr_batch(
         xml_args = homr_main.XmlGeneratorArguments(False, None, None)
         log_message(f'[homr] 开始识别（{_backend["label"]} 模式）…')
         _run_with_heartbeat(
-            lambda: homr_main.process_image(str(image_path), config, xml_args),
+            lambda: coreml_run.process(homr_main.process_image, str(image_path), config, xml_args),
             label='[homr] ',
             on_heartbeat=_on_heartbeat,
         )
+        if coreml_run.segnet is not None:
+            log_message(f'[homr] SegNet 已启用 Core ML 会话（{coreml_run.compute_units}）。')
         log_message('[homr] 识别完成。')
     except Exception as exc:
-        _exc_str = str(exc)
-        # CUDA / GPU 错误（session 创建成功但推理时失败）→ 回退 CPU 重试
-        _is_gpu_err = use_gpu_inference and (
-            'cuda' in _exc_str.lower()
-            or 'coreml' in _exc_str.lower()
-            or 'CUDAExecutionProvider' in _exc_str
-            or 'DmlExecutionProvider' in _exc_str
-            or 'CoreMLExecutionProvider' in _exc_str
-            or 'not active after session creation' in _exc_str
-        )
-        if _is_gpu_err:
+        if use_gpu_inference and _is_acceleration_error(exc):
+            fallback_marker.touch()
             try:
+                _download_cpu_models(homr_main)
                 _cpu_config = _build_processing_config(
                     homr_main, _batch_size,
                     transformer_use_gpu=False,
                     segnet_use_gpu=False,
                     coreml_encoder=False,
                 )
-                log_message('[homr] 回退到 CPU 模式重试…')
+                log_message(f'[homr] 加速失败，切换到 CPU 重试：{exc}', logging.WARNING)
                 _run_with_heartbeat(
-                    lambda: homr_main.process_image(str(image_path), _cpu_config, xml_args),
+                    lambda: AppleInferenceRun(batch_size=1 if sys.platform == 'darwin' else None).process(
+                        homr_main.process_image, str(image_path), _cpu_config, xml_args),
                     label='[homr] ',
                     on_heartbeat=_on_heartbeat,
                 )

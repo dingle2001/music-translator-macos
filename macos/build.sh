@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a native arm64 application that uses this checkout and its runtime.
+# Build an application for this Mac using the local checkout and its runtime.
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -28,7 +28,7 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 </dict></plist>
 PLIST
 
-xcrun swiftc -parse-as-library -O -target arm64-apple-macos14.0 \
+xcrun swiftc -parse-as-library -O -target "$(uname -m)-apple-macos14.0" \
     "$repo/macos/MusicTranslator.swift" -o "$app/Contents/MacOS/MusicTranslator"
 codesign --force --sign - "$app"
 ditto "$app" "$destination"

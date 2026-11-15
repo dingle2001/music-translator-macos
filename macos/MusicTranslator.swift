@@ -118,7 +118,8 @@ struct ConverterView: View {
                         Picker("Homr 后端", selection: $model.backend) {
                             Text("自动").tag("auto")
                             Text("CPU").tag("cpu")
-                            Text("Core ML").tag("coreml")
+                            Text("Core ML · GPU").tag("coreml-gpu")
+                            Text("Core ML · 神经网络引擎").tag("coreml-ane")
                         }.disabled(!needsOMR || model.omr != "homr")
                         Picker("唱名", selection: $model.pitch) {
                             Text("首调").tag("movable")

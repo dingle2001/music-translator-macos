@@ -35,7 +35,7 @@
 
 starpacker 的项目基于更早的 [xuxiran/translate-staff-to-simple-musical-notation](https://github.com/xuxiran/translate-staff-to-simple-musical-notation)，早期的模板匹配实现可在该仓库查阅。感谢 Xu Xiran、Ying Jiahe、starpacker 和各依赖项目的贡献者。
 
-**Mac 环境**：Apple Silicon（M 系列，arm64）、macOS 14 或更新版本、原生 Python 3.11 和 LilyPond 2.26（arm64）。构建原生应用需要 Xcode Command Line Tools。建议为常规转换预留至少 3 GB 可用磁盘空间。安装依赖与首次下载识谱模型需要联网。详见 [安装与硬件要求](docs/macos_setup.md)。
+**Mac 环境**：完整识谱流程使用 Apple Silicon（M 系列，arm64）、macOS 14 或更新版本、原生 Python 3.11 和 LilyPond 2.26。Intel Mac 可通过 CPU 导入已有 MusicXML/MXL。构建应用需要 Xcode Command Line Tools。建议为常规转换预留至少 3 GB 可用磁盘空间。详见 [安装与硬件要求](docs/macos_setup.md)。
 
 **Agent 辅助校谱**：支持能启动本地 stdio MCP 并读取图像结果的 Agent 工具，可按页读取原谱图、MusicXML 摘录和本地告警。见 [接入与复验指南](docs/agent_review.md)。
 
@@ -156,7 +156,7 @@ OMR 用的是 **Homr**（端到端光学乐谱识别，也可切到 Audiveris）
 
 ## 📦 安装
 
-Apple Silicon 用户可按 [macOS 安装与使用](docs/macos_setup.md) 配置原生运行环境并构建可双击的应用。Mac 默认使用 Homr + Core ML，Audiveris 可在窗口或命令行选择。
+Apple Silicon 用户可按 [macOS 安装与使用](docs/macos_setup.md) 配置原生运行环境并构建应用。Homr 会根据可用的后端与内存自动选择 Core ML 或 CPU，也可手动选择 GPU 或 Apple 神经网络引擎。Audiveris 可在窗口或命令行选择。见 [版本日志](CHANGELOG.md)。
 
 ### 1. 本项目 + Python 环境
 
@@ -442,7 +442,7 @@ python jianpu.py 曲笛.pdf --mode jianpu -o out/曲笛-简谱.pdf
 | `--title` | 简谱标题，默认取输入文件名 |
 | `--gpu {auto,on,off}` | OMR 是否用 GPU，默认 `auto` |
 | `--omr {homr,audiveris}` | 识谱引擎，默认 Homr |
-| `--backend {auto,cpu,coreml,cuda}` | Homr 推理后端，覆盖 `--gpu` |
+| `--backend {auto,cpu,coreml,coreml-gpu,coreml-ane,cuda}` | Homr 推理后端，覆盖 `--gpu`。Apple Silicon 可选 GPU 或 Apple 神经网络引擎 |
 | `--strict` | 遇到识谱不完整、原位缺行、备用排版或超限截尾时返回失败 |
 | `--midi PATH` | 导出 MIDI |
 | `--editor-workspace DIR` | 保存简谱校对文本与参考原谱 |

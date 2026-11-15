@@ -1,0 +1,7 @@
+# Intel Mac: local conversion of MusicXML/MXL with LilyPond.
+PyMuPDF==1.28.2
+music21==10.5.1
+Pillow==12.3.0
+numpy==2.4.6
+reportlab==5.1.0
+rich==15.0.0

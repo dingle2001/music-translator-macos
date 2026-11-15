@@ -98,10 +98,10 @@ def _check_ort_providers() -> None:
     else:
         ok('CPUExecutionProvider', detail)
     if 'CoreMLExecutionProvider' in providers:
-        ok('CoreMLExecutionProvider', '可用 —— Apple Silicon GPU/ANE 加速可开（--backend coreml）')
+        ok('CoreMLExecutionProvider', '可用。Apple Silicon 可用 --backend coreml-gpu 或 coreml-ane。')
     else:
         warn('CoreMLExecutionProvider',
-             '不可用：--backend coreml 会静默回退 CPU（检查是否装了 x86_64 版 onnxruntime）')
+             'Core ML 不可用，识谱使用 CPU。Apple Silicon 可检查 Python 和 ONNX Runtime 是否为 arm64。')
     if 'CUDAExecutionProvider' in providers or 'DmlExecutionProvider' in providers:
         ok('CUDA/DirectML', '存在（非 macOS 常规路径，注意 provider 混装）')
 

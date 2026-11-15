@@ -8,6 +8,8 @@ import sys
 import zipfile
 from pathlib import Path
 
+from core.omr.apple_coreml import BACKEND_CHOICES
+
 
 def pack_zip(paths, destination):
     """Write ``paths`` into one zip archive, flat (file names only).
@@ -43,7 +45,7 @@ def main(argv=None):
     parser.add_argument('--fixed-tonic', default='C', metavar='NOTE',
                         help='Fixed-pitch reference note (default C; e.g. D, Bb, F#)')
     parser.add_argument('--gpu', choices=('auto', 'on', 'off'), default='auto')
-    parser.add_argument('--backend', choices=('auto', 'cpu', 'coreml', 'cuda'))
+    parser.add_argument('--backend', choices=BACKEND_CHOICES)
     parser.add_argument('--omr', choices=('homr', 'audiveris'), default='homr')
     parser.add_argument('--strict', action='store_true')
     parser.add_argument('--zip', dest='zip_path', type=Path, default=None,

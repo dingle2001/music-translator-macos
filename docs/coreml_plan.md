@@ -1,5 +1,7 @@
 # Core ML 适配方案与实测结论
 
+这页记录 2026-10-25 的方案和基准。当前 GPU／神经网络引擎模式、跨页会话复用和内存适配见 [macOS 安装与使用](macos_setup.md#7-硬件加速与低内存设置)。
+
 - 日期：2026-10-25（末次更新：默认配置改为 segnet-only 后重测）
 - 机器：Apple Silicon（arm64），macOS 27.0.1
 - 运行时：onnxruntime 1.31.0、homr 0.7.0、Python 3.11.17

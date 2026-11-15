@@ -1,6 +1,8 @@
-# Apple Silicon 安装与使用
+# macOS 安装与使用
 
 实测环境为 macOS 27.2.1、Apple Silicon、Python 3.11.17 和 LilyPond 2.26.0。完成下文安装后，从仓库目录构建并双击 `../output/五线谱转简谱.app` 打开应用。应用使用构建时记录的源码目录和本机运行环境，移动源码目录后请重新构建。
+
+Intel Mac 请先看 [Intel Mac 导入 MusicXML](#intel-mac-导入-musicxml)。
 
 ```bash
 source scripts/env.sh
@@ -12,10 +14,10 @@ bash macos/build.sh
 
 | 组件 | 要求 | 检查命令 |
 |---|---|---|
-| 芯片 | Apple Silicon M 系列（arm64），Intel Mac 未验证 | `uname -m` → `arm64` |
+| 芯片 | Apple Silicon（M 系列）支持完整流程。Intel Mac 可导入已有 MusicXML/MXL | `uname -m` |
 | 系统 | 原生应用的构建目标为 macOS 14+，实测 macOS 27.2.1 | `sw_vers` |
-| Python | 原生 arm64 Python 3.11 | `python -V` |
-| 排版 | LilyPond 2.26 原生 arm64 | `lilypond --version` |
+| Python | 与本机芯片架构匹配的 Python 3.11 | `python -V` |
+| 排版 | 与本机芯片架构匹配的 LilyPond 2.26 | `lilypond --version` |
 | 命令行工具 | 构建应用需要 Xcode Command Line Tools（含 Swift） | `xcode-select -p` |
 | 磁盘 | 常规转换建议至少 3 GB 可用空间，用于依赖、模型、缓存和产物；音频模型另计 | `df -h .` |
 | 内存 | 未验证统一的最低内存，所需内存随识谱后端、页图尺寸和乐谱复杂度而变化 | — |
@@ -180,38 +182,59 @@ python -m pip install torch==2.15.0 piano-transcription-inference==0.0.6 torchli
 python jianpu.py 钢琴.mp3 --mode jianpu --strict --midi ../output/钢琴.mid -o ../output/钢琴
 ```
 
-## 7. Core ML / Apple 加速（默认开启）
+## 7. 硬件加速与低内存设置
 
-在 Apple Silicon 上，`--backend auto`（默认）会启用 **Core ML**：segnet 跑在 GPU/ANE，transformer 留在 CPU（decoder 无法上 Core ML）。无需任何参数：
+Mac 窗口可在「Homr 后端」选择自动、CPU、Core ML · GPU 或 Core ML · 神经网络引擎。命令行和目录批处理使用同一个后端参数。
 
-```bash
-python jianpu.py 曲笛.pdf --mode jianpu -o ../output/qudi
-# 日志首行会写明实际后端：[homr] 推理后端: CoreML（仅 segnet，encoder/decoder 在 CPU）
-```
+| 后端 | 适用情况 |
+|---|---|
+| `auto`（默认） | Apple Silicon 上有 Core ML 且可用内存足够时，使用 Core ML 的 CPU + GPU 配置。可用内存不足约 2 GiB 或 Core ML 不可用时走 CPU。 |
+| `coreml-gpu` | 允许 Core ML 使用 Apple GPU 和 CPU。 |
+| `coreml-ane` | 允许 Core ML 使用 Apple Neural Engine（ANE）和 CPU。 |
+| `cpu` | 使用 CPU 推理，可用于低内存机器或排查加速兼容性。 |
+| `coreml` | 兼容已有命令。默认 CPU + GPU，可用环境变量覆盖。 |
 
-实测（本机，同输入）：
+默认只把 Homr 的 SegNet 图像分割交给 Core ML。谱表编码器、解码器及后续排版默认使用 CPU。多页 PDF 在同一次识谱中复用已激活的 SegNet 会话。若加速执行发生错误，应用会记录原因并以 CPU 重试。回退结果可用于本次导出，下次会重新尝试所选加速后端。
 
-| 场景 | CPU | Apple 加速（默认） | 说明 |
-|---|---|---|---|
-| 整本 5 页 / 193 小节 | 20.87 s | **21.06 s** | 基本持平，计算在 GPU/ANE |
-| 单页 5 行谱表 | 4.84 s | 8.34–8.41 s | 固定开销摊不开，慢约 1.7× |
-
-因此：
-
-- **整本分谱**：用默认（Apple 加速）。
-- **单页片段 / 大量短 PDF 批处理 / CI**：`--backend cpu`（或 `export HOMR_BACKEND=cpu`）更快。
-- 首次运行会生成 `homr/segmentation/*_fp16.coreml_cache`（约 55 MB）；若开启 encoder 另需 182 MB。
-- 想量化对比：
+可用内存越少，SegNet 批大小上限越低。8 GB 及以下的 Mac 默认最多 4，内存紧张时降为 2 或 1。可用 `HOMR_SEGNET_BATCH_SIZE=1` 手动限制批大小。表中的内存阈值用于选后端和批大小，实际需求取决于乐谱页尺寸和其他应用的占用。
 
 ```bash
-python scripts/bench_backends.py --pdf 曲笛.pdf --page 1 --backends cpu,coreml --repeat 2 \
-    --out docs/bench_coreml.json
+python jianpu.py 曲笛.pdf --mode jianpu --backend coreml-gpu -o ../output/曲笛-gpu
+python jianpu.py 曲笛.pdf --mode jianpu --backend coreml-ane -o ../output/曲笛-ane
+HOMR_SEGNET_BATCH_SIZE=1 python jianpu.py 曲笛.pdf --mode jianpu --backend cpu -o ../output/曲笛-cpu
 ```
 
-- 实验开关（都不是默认值）：
-  - `HOMR_COREML_ENCODER=1` 把 encoder 也放上 Core ML（实测更慢）；
-  - `HOMR_COREML_COMPUTE_UNITS=ALL` 使用 ANE（实测明显更慢，20.59 s vs 12.54 s）。
-- 若某台机器 Core ML 异常，推理会自动回退 CPU 重试，日志以**实际**后端为准。
+Apple M5 Max、macOS 27.2.1、Homr 0.7.0、ONNX Runtime 1.31.0。每种模式单独起进程，各测一次，计入模型会话加载，不计简谱排版。磁盘上已有模型及 Core ML 编译缓存。
+
+| 《曲笛》样谱 | CPU | Core ML GPU | Core ML ANE |
+|---|---:|---:|---:|
+| 5 页、193 小节 | 20.71 秒 | 14.94 秒 | 20.87 秒 |
+| 第 1 页 | 4.77 秒 | 3.84 秒 | 4.96 秒 |
+| 第 1 页，批大小限制为 1 | 4.34 秒 | 3.78 秒 | 4.31 秒 |
+
+三种模式的样谱小节数、音符音高、音符起点、时值和休止序列一致。单页 GPU 批大小从默认值降到 1 后，识谱进程峰值 RSS 由约 2.51 GiB 降到 1.98 GiB。RSS 只反映进程驻留内存，各机型速度和统一内存占用以实际测试为准。低内存策略已用模拟内存输入测试，批大小 1 已在本机运行真实样谱。
+
+复测与诊断：
+
+```bash
+python scripts/bench_backends.py --pdf 曲笛.pdf --backends cpu,coreml-gpu,coreml-ane --repeat 2
+HOMR_COREML_PROFILE=1 python jianpu.py 曲笛.pdf --mode jianpu --backend coreml-ane -o ../output/诊断
+```
+
+计算计划诊断依赖系统和运行时支持的 Core ML Compute Plan，通常需要 macOS 14.4 或更新版本。它会列出算子的首选设备和估计成本。正常转换日志会显示 Core ML 会话是否激活、是否复用、是否回退。见 [ONNX Runtime Core ML 说明](https://onnxruntime.ai/docs/execution-providers/CoreML-ExecutionProvider.html)。
+
+### Intel Mac 导入 MusicXML
+
+使用 x86_64 Python 3.11 建立虚拟环境，安装 `requirements-macos-intel.txt`，并将 x86_64 版 LilyPond 2.26 放在 `PATH`，或通过 `LILYPOND` 指定其路径。可用已有 MusicXML/MXL 生成简谱，也可通过 `--mxl` 提供与原 PDF 对应的 MusicXML。构建脚本会按当前架构生成应用。
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements-macos-intel.txt
+python jianpu.py tests/fixtures/sheng_original.musicxml --mode jianpu -o ../output/笙
+```
+
+当前完整 Homr 依赖集缺少受支持的 Intel Mac ONNX Runtime 轮子。Intel 导入流程已用 x86_64 Python 和 LilyPond 在 Rosetta 环境验证，原生 Intel 实机尚未验收。
 
 ---
 
@@ -228,11 +251,13 @@ python -m unittest discover -s tests -v
 |---|---|
 | `LILYPOND` | 直接指定 LilyPond 可执行文件 |
 | `LILYPOND_PATH` / `LILYPOND_HOME` | `core/render/lilypond_runner.py` 的查找根 |
-| `HOMR_BACKEND` | `auto` / `cpu` / `coreml` / `cuda`，CLI `--backend` 优先；macOS 默认 `auto`→coreml |
+| `HOMR_BACKEND` | `auto` / `cpu` / `coreml` / `coreml-gpu` / `coreml-ane` / `cuda`，CLI `--backend` 优先 |
 | `SUMISORA_ROOT` | 用外部 SumisoraOMR 覆盖内置 `core/` |
 | `XDG_CACHE_HOME` | 给 fontconfig 一个可写的缓存目录 |
 | `HOMR_COREML_ENCODER` | `1` = encoder 也上 Core ML（默认 `0`，仅 segnet） |
-| `HOMR_COREML_COMPUTE_UNITS` | 覆盖 homr 的 `CPUAndGPU`（可选 `ALL` / `CPUOnly`；实测 `ALL` 更慢） |
+| `HOMR_COREML_COMPUTE_UNITS` | 兼容 `coreml` 模式的计算单元设置，支持 `CPUAndGPU`、`CPUAndNeuralEngine`、`ALL` 和 `CPUOnly`。显式 GPU 或 ANE 模式优先 |
+| `HOMR_COREML_PROFILE` | `1` 启用计算计划诊断，并跳过已有识谱结果缓存 |
+| `HOMR_SEGNET_BATCH_SIZE` | macOS 可设为 `1`、`2`、`4` 或 `8`，覆盖自动计算的 SegNet 批大小上限 |
 | `HOMR_COREML_MODEL_CACHE_DIR` | 覆盖 Core ML 编译缓存位置 |
 
 ---
@@ -241,4 +266,4 @@ python -m unittest discover -s tests -v
 
 本机已验证 PDF 和图像识谱、MusicXML/MXL 导入、整页和原位排版、移调、MIDI、批量 ZIP、校对文本、钢琴 MP3 转录及 Mac 窗口导出。已通过 stdio MCP 验证逐页返回原谱图和对应 MusicXML。
 
-macOS 交付为依赖本地源码与运行环境的 arm64 应用。独立安装包、公证、简谱与五线谱同步编辑和完整的人工逐音准确率仍待实现或验收。
+macOS 应用以当前架构构建，依赖本地源码与运行环境。独立安装包、公证、简谱与五线谱同步编辑和完整的人工逐音准确率仍待实现或验收。

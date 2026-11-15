@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Benchmark OMR inference backends (CPU vs Core ML) on macOS Apple Silicon.
+"""Compare CPU, GPU and Neural Engine OMR modes on Apple Silicon.
 
 Every backend runs in its **own subprocess**, so cold-start costs (ONNX Runtime
 session creation, Core ML MLProgram compilation) are measured honestly instead
@@ -10,16 +10,16 @@ What is measured
 * wall time of the OMR stage only (PDF → MusicXML; no LilyPond typesetting), and
 * peak RSS of that subprocess (``resource.getrusage``), and
 * a structural diff of the resulting MusicXML against the reference backend
-  (measure count, note/rest count, sounding-pitch sequence).
+  (measure count, pitches, event offsets and durations).
 
 The diff matters more than the timings: a faster backend that drops or invents a
 note is a regression, not an optimisation (see docs/repo_audit.md).
 
 Usage
 -----
-    # single page, CPU vs Core ML, 2 runs each (2nd run = warm model cache)
+    # Single page, two independent processes per mode
     python scripts/bench_backends.py --pdf 曲笛.pdf --page 1 \
-        --backends cpu,coreml --repeat 2
+        --backends cpu,coreml-gpu,coreml-ane --repeat 2
 
     # whole PDF, JSON report for docs
     python scripts/bench_backends.py --pdf 曲笛.pdf --out docs/bench_coreml.json
@@ -27,10 +27,8 @@ Usage
 Notes
 -----
 * ``cpu``   → fp32 segnet + fp32 transformer, CPUExecutionProvider only.
-* ``coreml``→ fp16 segnet on CoreML, fp16 encoder on CoreML, decoder on CPU
-  (the decoder cannot run on the Core ML EP: dynamic KV-cache dimension).
-* Core ML compiles the encoder to an MLProgram the first time; homr caches it
-  next to the model file, so the first ``coreml`` run is expected to be slow.
+* Core ML modes accelerate SegNet by default. The encoder and decoder use CPU.
+* On-disk Core ML caches can survive across runs.
 """
 from __future__ import annotations
 
@@ -62,8 +60,10 @@ t0 = time.perf_counter()
 error = None
 try:
     res = run_homr_batch(pdf, out_dir, backend=backend)
-    if res is None:
-        error = "run_homr_batch returned None"
+    if res is None or (res / '.partial-omr').exists():
+        error = "Recognition did not complete"
+    elif (res / '.cpu-fallback-omr').exists():
+        error = "Accelerated mode fell back to CPU"
 except Exception:
     error = traceback.format_exc(limit=3)
 wall = time.perf_counter() - t0
@@ -91,7 +91,12 @@ def _run_backend(pdf: Path, backend: str, out_dir: Path) -> dict:
     proc = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True)
     for line in proc.stdout.splitlines():
         if line.startswith('__RESULT__'):
-            return json.loads(line[len('__RESULT__'):])
+            result = json.loads(line[len('__RESULT__'):])
+            result['coreml_sessions'] = proc.stdout.count('SegNet 已启用 Core ML 会话')
+            result['coreml_page_reuses'] = proc.stdout.count('SegNet 复用 Core ML 会话')
+            if backend in ('coreml-gpu', 'coreml-ane') and not result['coreml_sessions'] and not result['error']:
+                result['error'] = 'Core ML SegNet session was not observed'
+            return result
     return {'backend': backend, 'wall_s': None, 'peak_rss_mb': None,
             'error': (proc.stderr or proc.stdout)[-1500:]}
 
@@ -102,23 +107,30 @@ def _summarise_mxl(mxl: Path) -> dict:
 
     score = converter.parse(str(mxl))
     pitches: list[str] = []
+    event_sequence = []
     measures = 0
     notes = 0
     rests = 0
     for part in score.parts:
         for m in part.getElementsByClass('Measure'):
             measures += 1
+            measure_events = []
             for el in m.flatten().notesAndRests:
                 if isinstance(el, note.Rest):
                     rests += 1
+                    pitch = 'rest'
                 elif isinstance(el, chord.Chord):
                     notes += 1
-                    pitches.append('+'.join(p.nameWithOctave for p in el.pitches))
+                    pitch = '+'.join(p.nameWithOctave for p in el.pitches)
+                    pitches.append(pitch)
                 else:
                     notes += 1
-                    pitches.append(el.pitch.nameWithOctave)
+                    pitch = el.pitch.nameWithOctave
+                    pitches.append(pitch)
+                measure_events.append((str(el.offset), str(el.quarterLength), pitch))
+            event_sequence.append(measure_events)
     return {'measures': measures, 'notes': notes, 'rests': rests,
-            'pitches': pitches}
+            'pitches': pitches, 'events': event_sequence}
 
 
 def _diff(ref: dict, other: dict) -> dict:
@@ -129,6 +141,7 @@ def _diff(ref: dict, other: dict) -> dict:
         'notes_delta': other['notes'] - ref['notes'],
         'rests_delta': other['rests'] - ref['rests'],
         'pitch_sequence_identical': a == b,
+        'event_sequence_identical': ref['events'] == other['events'],
         'first_pitch_mismatch_at': first,
         'first_pitch_mismatch': None if first is None else {'ref': a[first], 'other': b[first]},
     }
@@ -138,7 +151,7 @@ def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description='Benchmark OMR backends (CPU vs Core ML)')
     ap.add_argument('--pdf', type=Path, required=True)
     ap.add_argument('--page', type=int, default=None, help='只跑第 N 页（1-based）')
-    ap.add_argument('--backends', default='cpu,coreml')
+    ap.add_argument('--backends', default='cpu,coreml-gpu,coreml-ane')
     ap.add_argument('--repeat', type=int, default=1, help='每个后端重复次数（取最好一次）')
     ap.add_argument('--out', type=Path, default=None, help='JSON 报告输出路径')
     args = ap.parse_args(argv)
@@ -163,7 +176,7 @@ def main(argv: list[str]) -> int:
                 mxl = next(iter(sorted(out_dir.glob('*.musicxml'))), None)
                 res['run'] = i + 1
                 res['musicxml'] = str(mxl) if mxl else None
-                if mxl:
+                if mxl and not res.get('error'):
                     try:
                         fp = _summarise_mxl(mxl)
                         res['measures'] = fp['measures']
@@ -174,8 +187,9 @@ def main(argv: list[str]) -> int:
                         res['parse_error'] = repr(exc)
                 runs.append(res)
                 status = 'ok' if not res.get('error') else 'FAILED'
-                print(f'[{backend} run {i + 1}] {status} '
-                      f'wall={res["wall_s"]:.2f}s rss={res["peak_rss_mb"]:.0f}MB '
+                wall = f'{res["wall_s"]:.2f}s' if res['wall_s'] is not None else '—'
+                rss = f'{res["peak_rss_mb"]:.0f}MB' if res['peak_rss_mb'] is not None else '—'
+                print(f'[{backend} run {i + 1}] {status} wall={wall} rss={rss} '
                       f'notes={res.get("notes")}', flush=True)
             ok = [r for r in runs if r.get('wall_s') and not r.get('error')]
             report['runs'][backend] = {
@@ -198,7 +212,7 @@ def main(argv: list[str]) -> int:
             args.out.parent.mkdir(parents=True, exist_ok=True)
             args.out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
             print(f'\n报告已写入 {args.out}')
-        return 0
+        return int(any(not result['best_wall_s'] for result in report['runs'].values()))
     finally:
         shutil.rmtree(workroot, ignore_errors=True)
 

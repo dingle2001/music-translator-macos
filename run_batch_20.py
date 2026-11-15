@@ -12,6 +12,8 @@ import sys
 import time
 from pathlib import Path
 
+from core.omr.apple_coreml import BACKEND_CHOICES
+
 ROOT = Path(__file__).resolve().parent
 GROUPS = ['小河淌水', '渔歌', '雨夜花', '黑走马']
 
@@ -20,7 +22,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--input', type=Path, default=ROOT / 'input' / '吹管')
     parser.add_argument('--output', type=Path, default=ROOT / 'output_fixed' / '吹管')
-    parser.add_argument('--backend', choices=('auto', 'cpu', 'coreml', 'cuda'), default='auto')
+    parser.add_argument('--backend', choices=BACKEND_CHOICES, default='auto')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     with (args.output / 'batch_20_run.log').open('w', encoding='utf-8') as log:

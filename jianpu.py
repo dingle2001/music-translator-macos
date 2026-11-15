@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Optional
 
 from _env import ensure_sumisora
+from core.omr.apple_coreml import BACKEND_CHOICES
 
 HERE = Path(__file__).resolve().parent
 AUDIO_SUFFIXES = {'.wav', '.flac', '.ogg', '.mp3'}
@@ -62,7 +63,7 @@ def omr_to_musicxml(score_pdf: Path, work: Path, use_gpu: Optional[bool] = None,
             continue
     pipeline = hashlib.sha256()
     pipeline.update((HERE / 'homr_shim.py').read_bytes())
-    for name in ('core/config.py', 'core/utils.py', 'core/omr/homr_runner.py',
+    for name in ('core/config.py', 'core/utils.py', 'core/omr/homr_runner.py', 'core/omr/apple_coreml.py',
                  'core/omr/multirest_collapse.py', 'core/omr/vector_whole_chords.py',
                  'core/omr/dl_fix.py',
                  'core/image/image_preprocess.py',
@@ -71,17 +72,18 @@ def omr_to_musicxml(score_pdf: Path, work: Path, use_gpu: Optional[bool] = None,
                  'core/notation/jianpu/extract.py',
                  'core/notation/tie_reconstruction.py'):
         pipeline.update((root / name).read_bytes())
+    backend_config = _backend_from_flags(use_gpu, backend)
+    profile_coreml = backend_config.get('compute_units') and os.environ.get('HOMR_COREML_PROFILE') == '1'
     expected = {'source_sha256': _sha256_file(score_pdf),
-                'backend': _backend_from_flags(use_gpu, backend),
-                'coreml_compute_units': os.environ.get('HOMR_COREML_COMPUTE_UNITS'),
+                'backend': backend_config,
                 'pipeline_sha256': pipeline.hexdigest(),
                 'versions': versions,
-                'cache_schema': 2}
+                'cache_schema': 3}
     try:
         cached_metadata = json.loads(metadata.read_text(encoding='utf-8'))
     except (OSError, ValueError):
         cached_metadata = None
-    if isinstance(cached_metadata, dict) and cached.is_file() and cached.stat().st_size > 0:
+    if not profile_coreml and isinstance(cached_metadata, dict) and cached.is_file() and cached.stat().st_size > 0:
         cached_digest = cached_metadata.pop('musicxml_sha256', None)
         if cached_metadata == expected and cached_digest == _sha256_file(cached):
             print(f'[omr] 复用已有结果 {cached}')
@@ -105,6 +107,7 @@ def omr_to_musicxml(score_pdf: Path, work: Path, use_gpu: Optional[bool] = None,
             raise RuntimeError('OMR 没有产生 MusicXML')
         relative_xml = raw.relative_to(job)
         partial = (Path(res) / '.partial-omr').exists()
+        cpu_fallback = (Path(res) / '.cpu-fallback-omr').exists()
         if out_dir.is_dir():
             shutil.rmtree(out_dir)
         shutil.move(job, out_dir)
@@ -122,6 +125,8 @@ def omr_to_musicxml(score_pdf: Path, work: Path, use_gpu: Optional[bool] = None,
         if strict:
             raise RuntimeError(f'识谱或后处理不完整，请检查 {out_dir}')
         print('[omr] 警告：识谱或后处理不完整，本次继续生成，但不作为完整结果缓存。')
+    elif cpu_fallback:
+        print('[omr] 本次使用 CPU 回退结果，下次会重新尝试所选加速后端。')
     else:
         expected['musicxml_sha256'] = _sha256_file(cached)
         metadata.write_text(json.dumps(expected, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -537,8 +542,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument('--title', default=None, help='标题（默认取输入文件名）')
     ap.add_argument('--gpu', choices=('auto', 'on', 'off'), default='auto',
                     help='OMR 是否用 GPU（默认 auto；保留旧语义，新脚本请用 --backend）')
-    ap.add_argument('--backend', choices=('auto', 'cpu', 'coreml', 'cuda'), default=None,
-                    help='OMR 推理后端：cpu / coreml(Apple Silicon) / cuda / auto（默认）')
+    ap.add_argument('--backend', choices=BACKEND_CHOICES, default=None,
+                    help='Homr 后端。Apple Silicon 可选 coreml-gpu 或 coreml-ane，默认 auto。')
     ap.add_argument('--omr', choices=('homr', 'audiveris'), default='homr',
                     help='乐谱识别引擎（默认 Homr）')
     ap.add_argument('--strict', action='store_true', help='识谱不完整、备用排版或原位缺行时返回失败')
