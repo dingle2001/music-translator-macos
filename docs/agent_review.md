@@ -2,20 +2,16 @@
 
 `music-translator` 是本地 stdio MCP 服务。一次调用读取一页原谱并返回 PNG、该页 MusicXML 摘录和原位报告中的对齐、超时值、延音疑点。服务只读，模型与账号由 Agent 客户端管理。页图和摘录进入 Agent 会话，数据处理方式取决于客户端和所用模型。
 
-## Codex
+## 接入支持 MCP 的 Agent 工具
 
-安装好[项目运行环境](macos_setup.md)后，在仓库根目录执行：
+安装好[项目运行环境](macos_setup.md)后，在仓库根目录安装 MCP SDK：
 
 ```bash
-bash scripts/register_codex_mcp.sh
-codex mcp get music-translator
+source scripts/env.sh
+python -m pip install 'mcp==1.30.0'
 ```
 
-脚本会在当前项目环境安装可选的 Python MCP SDK，并将服务注册到 Codex。若打开的会话尚未列出该工具，重开 Codex。Mac 应用转换单份 PDF 后，点「复制 Codex 校谱指令」并粘贴到会话。也可以在已有的转换产物上直接调用工具。参见 [OpenAI 的 Codex MCP 配置说明](https://developers.openai.com/codex/mcp)。
-
-## 其他支持 MCP 的 Agent
-
-在项目目录执行 `source scripts/env.sh`，再用 `python -m pip install 'mcp==1.30.0'` 安装 SDK。通过 uv 管理环境时，也可用 `uv pip install --python "$(command -v python)" 'mcp==1.30.0'`。按客户端的配置格式注册以下 stdio 服务，换成真实的绝对路径：
+通过 uv 管理环境时，也可用 `uv pip install --python "$(command -v python)" 'mcp==1.30.0'`。在客户端添加本地 stdio MCP 服务，命令设为 `/bin/bash`，参数为启动脚本的绝对路径。客户端使用 `mcpServers` JSON 配置时，可参考下面的示例：
 
 ```json
 {
@@ -29,6 +25,8 @@ codex mcp get music-translator
 ```
 
 客户端需要能启动本机进程、访问指定文件，并把工具返回的 MCP 图像和文本交给支持视觉输入的模型。启动脚本的诊断信息写到 stderr，stdout 用于 MCP 协议。
+
+启用服务后，在客户端的工具列表中确认已有 `review_score_page`。用 Mac 应用转换单份 PDF 后，点「复制校谱提示」并粘贴到 Agent 会话。已有转换产物时，可直接在会话中提供文件路径和页码。
 
 ## 按页核验和确认修订
 

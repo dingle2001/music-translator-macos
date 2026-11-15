@@ -700,7 +700,7 @@ def main(argv: list[str]) -> int:
         }
         if args.mode in ('insitu', 'both') and review_mxl == mxl:
             parameters['report_path'] = str(out.with_suffix('.report.json').resolve())
-        print('[codex] ' + json.dumps(parameters, ensure_ascii=False))
+        print('[agent-review] ' + json.dumps(parameters, ensure_ascii=False))
     return 0
 
 

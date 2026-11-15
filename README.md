@@ -31,13 +31,13 @@
 
 ## 项目来源
 
-这是 [starpacker/music_translator](https://github.com/starpacker/music_translator) 的 macOS 适配版，保留上游的五线谱识别、整页简谱与原位对照流程，并提供 Apple Silicon 上的原生应用、Core ML 加速和 Agent 辅助校谱接口。想了解原有转换流程及其维护进展，可前往 [直接上游仓库](https://github.com/starpacker/music_translator)。
+这是 [starpacker/music_translator](https://github.com/starpacker/music_translator) 的 macOS 适配版，保留上游的五线谱识别、整页简谱与原位对照流程，并提供 Apple Silicon 上的原生应用、Core ML 加速和 Agent 辅助校谱接口。
 
-starpacker 的项目沿用了更早的五线谱转简谱工作。感谢 [xuxiran/translate-staff-to-simple-musical-notation](https://github.com/xuxiran/translate-staff-to-simple-musical-notation) 的 Xu Xiran、Ying Jiahe，以及 starpacker 和各依赖项目的贡献者。早期模板匹配实现可从 [xuxiran 的原始项目](https://github.com/xuxiran/translate-staff-to-simple-musical-notation) 查阅。
+starpacker 的项目基于更早的 [xuxiran/translate-staff-to-simple-musical-notation](https://github.com/xuxiran/translate-staff-to-simple-musical-notation)，早期的模板匹配实现可在该仓库查阅。感谢 Xu Xiran、Ying Jiahe、starpacker 和各依赖项目的贡献者。
 
 **Mac 环境**：Apple Silicon（M 系列，arm64）、macOS 14 或更新版本、原生 Python 3.11 和 LilyPond 2.26（arm64）。构建原生应用需要 Xcode Command Line Tools。建议为常规转换预留至少 3 GB 可用磁盘空间。安装依赖与首次下载识谱模型需要联网。详见 [安装与硬件要求](docs/macos_setup.md)。
 
-**Agent 辅助校谱**：通过本地 MCP 读取指定页的原谱图、MusicXML 摘录和本地告警。支持 Codex 及能启动 stdio MCP 并读取图像结果的客户端。见 [接入与复验指南](docs/agent_review.md)。
+**Agent 辅助校谱**：支持能启动本地 stdio MCP 并读取图像结果的 Agent 工具，可按页读取原谱图、MusicXML 摘录和本地告警。见 [接入与复验指南](docs/agent_review.md)。
 
 ## ✨ 这是什么
 
@@ -450,7 +450,7 @@ python jianpu.py 曲笛.pdf --mode jianpu -o out/曲笛-简谱.pdf
 | `--melody-only` | 钢琴音频只提取主旋律 |
 | `--no-vector-slurs` | 跳过「从 PDF 连奏线重建 slur」，改用 MusicXML 原有标记 |
 
-可在 Codex 中通过本地 MCP 按页校对已转换的分谱。见 [Agent 辅助校谱](docs/agent_review.md)。
+可通过本地 MCP 用 Agent 工具按页校对已转换的分谱。见 [Agent 辅助校谱](docs/agent_review.md)。
 
 ---
 
@@ -672,6 +672,12 @@ python main.py ../input/erhu_p1.png
 选 AGPL 是因为运行期依赖链里有 AGPL 组件（SumisoraOMR、Homr、PyMuPDF）。
 
 第三方组件的版本、许可与本地修改说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+## 参与改进与注明出处
+
+欢迎大家在原项目或本 macOS 适配版的基础上继续完善、优化，并按相应许可证开源分享改进成果。也欢迎提交问题反馈或通过 Pull Request 将改进回馈给对应项目。
+
+使用、引用或改进本项目时，请注明所使用的仓库和上游出处，保留原作者署名及许可证声明。公开改进版时，请说明基于哪个项目以及做了哪些改动。
 
 ---
 

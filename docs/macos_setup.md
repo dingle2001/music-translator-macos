@@ -160,7 +160,7 @@ Mac 窗口也能打开生成的 `.jianpu.txt`，交给文本编辑修改，再�
 
 ### Agent 辅助校谱
 
-转换完成后可用本地 MCP 把指定页的原谱图、MusicXML 摘录和疑点交给 Codex 或其他 Agent。见 [Agent 校谱接入](agent_review.md)。
+转换完成后可用本地 MCP 把指定页的原谱图、MusicXML 摘录和疑点交给兼容的 Agent 工具。见 [Agent 校谱接入](agent_review.md)。
 
 ### Audiveris
 
@@ -239,6 +239,6 @@ python -m unittest discover -s tests -v
 
 ## 10. 验收范围
 
-本机已验证 PDF 和图像识谱、MusicXML/MXL 导入、整页和原位排版、移调、MIDI、批量 ZIP、校对文本、钢琴 MP3 转录及 Mac 窗口导出。本地 MCP 已在 Codex 中验证逐页返回原谱图和对应 MusicXML。
+本机已验证 PDF 和图像识谱、MusicXML/MXL 导入、整页和原位排版、移调、MIDI、批量 ZIP、校对文本、钢琴 MP3 转录及 Mac 窗口导出。已通过 stdio MCP 验证逐页返回原谱图和对应 MusicXML。
 
 macOS 交付为依赖本地源码与运行环境的 arm64 应用。独立安装包、公证、简谱与五线谱同步编辑和完整的人工逐音准确率仍待实现或验收。
