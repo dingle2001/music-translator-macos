@@ -34,21 +34,27 @@ def _maestro_rest_numbers(page):
 
     candidates = {}
     for xref, extension, _, name, *_ in page.get_fonts(full=True):
-        if extension != 'ttf' or name in candidates:
+        if extension != 'ttf':
             continue
+        name = re.sub(r'^[A-Z]{6}\+', '', name)
         try:
             with TTFont(BytesIO(page.parent.extract_font(xref)[3]), lazy=True) as font:
                 if font['name'].getDebugName(6) != 'Maestro':
                     continue
                 cmap = next((table.cmap for table in font['cmap'].tables
                              if table.platformID == 3 and table.platEncID == 0), {})
-                candidates[name] = {cp: font.getGlyphID(cmap[cp])
-                                    for cp in range(0xF030, 0xF03A) if cp in cmap}
+                verified = {cp: font.getGlyphID(cmap[cp])
+                            for cp in range(0xF030, 0xF03A) if cp in cmap}
+                if name not in candidates:
+                    candidates[name] = verified
+                else:
+                    candidates[name] = {cp: gid for cp, gid in candidates[name].items()
+                                        if verified.get(cp) == gid}
         except (OSError, KeyError, ValueError):
             continue
     numbers = set()
     for span in page.get_texttrace():
-        glyphs = candidates.get(span['font'], {})
+        glyphs = candidates.get(re.sub(r'^[A-Z]{6}\+', '', span['font']), {})
         run = []
         for cp, gid, (x, y), _ in [*span['chars'], (0, 0, (0, 0), ())]:
             verified = bool(gid and glyphs.get(cp) == gid)
@@ -138,6 +144,39 @@ def _matched_first_note_x(measure, staff, left, right, heads):
     return events[0][0][0], events[1][0][0] if len(events) > 1 else None
 
 
+def printed_rest_strokes(drawings, staff, left, right, *, require_caps=False):
+    """Find rest strokes in one source cell, at staff scale."""
+    middle = (staff.top + staff.bottom) / 2
+    space = staff.line_spacing
+    strokes = [d['rect'] for d in drawings
+               if (d['type'] == 's' and (d.get('width') or 0) >= .28 * space
+                   or d['type'] in ('f', 'fs') and .28 * space <= d['rect'].height <= .85 * space)
+               and d['rect'].width >= 2 * space
+               and abs((d['rect'].y0 + d['rect'].y1) / 2 - middle) <= .22 * space
+               and left <= d['rect'].x0 < d['rect'].x1 <= right
+               and (d['type'] != 's' or d['rect'].height <= .20 * space)]
+    if not require_caps or not strokes:
+        return strokes
+    caps = [(d['rect'].x0 + d['rect'].x1) / 2 for d in drawings
+            if d['rect'].width <= .42 * space and space <= d['rect'].height <= 2.6 * space
+            and d['rect'].y0 <= middle - .30 * space and d['rect'].y1 >= middle + .30 * space]
+    return [stroke for stroke in strokes
+            if all(any(abs(x - cap) <= .36 * space for cap in caps)
+                   for x in (stroke.x0, stroke.x1))]
+
+
+def printed_rest_info(strokes, staff, numbers):
+    """Find the unique printed number near a stroke, allowing an overhang for narrow cells."""
+    if len(strokes) != 1:
+        return None
+    stroke = strokes[0]
+    counts = {(round(x, 1), round(y, 1), n) for x, y, n in numbers
+              if stroke.x0 - .35 * staff.line_spacing <= x <= stroke.x1
+              and staff.top - 3 * staff.line_spacing <= y < staff.top
+              and 2 <= n <= 999}
+    return (float(stroke.x0), counts.pop()[2]) if len(counts) == 1 else None
+
+
 def _matched_multirest_info(page, measure, staff, left, right, numbers):
     """Return the stroke position and unique printed count, if corroborated."""
     events = list(measure.recurse().notesAndRests)
@@ -145,23 +184,8 @@ def _matched_multirest_info(page, measure, staff, left, right, numbers):
         return None
     if abs(float(events[0].getOffsetInHierarchy(measure))) > 1e-7:
         return None
-    middle = (staff.top + staff.bottom) / 2
-    drawings = page.get_drawings()
-    strokes = [d['rect'] for d in drawings
-               if d['type'] == 's' and (d.get('width') or 0) >= 1.5
-               and d['rect'].height <= 1 and d['rect'].width >= 2 * staff.line_spacing
-               and abs(d['rect'].y0 - middle) <= 1
-               and left <= d['rect'].x0 < d['rect'].x1 <= right]
-    if len(strokes) != 1:
-        return None
-    stroke = strokes[0]
-    # An isolated thick stroke may be an ordinary musical mark. A printed
-    # count may only be applied to the corroborating full-measure rest above.
-    counts = [n for x, y, n in numbers if stroke.x0 <= x <= stroke.x1
-              and staff.top - 3 * staff.line_spacing <= y < staff.top]
-    if len(counts) != 1:
-        return None
-    return float(stroke.x0), counts[0]
+    strokes = printed_rest_strokes(page.get_drawings(), staff, left, right)
+    return printed_rest_info(strokes, staff, numbers)
 
 
 def _matched_multirest_x(page, measure, staff, left, right, numbers):

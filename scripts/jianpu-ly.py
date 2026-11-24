@@ -846,7 +846,11 @@ class NoteheadMarkup:
       if dotted: self.barPos -= F(64)/denom/2
       if self.barPos<0: errExit("Anacrusis is longer than bar in score %d" % scoreNo) # but anacrusis being exactly equal to bar is OK: we'll just interpret that as no anacrusis
       self.startBarPos = self.barPos
-  def wholeBarRestLen(self): return {96:"1.",48:"2.",32:"2",24:"4.",16:"4",12:"8.",8:"8"}.get(self.barLength,"1") # TODO: what if irregular?
+  def wholeBarRestLen(self):
+    length = F(self.barLength) / 64
+    return {F(1): "1", F(3, 2): "1.", F(3, 4): "2.", F(1, 2): "2",
+            F(3, 8): "4.", F(1, 4): "4", F(3, 16): "8.", F(1, 8): "8"}.get(
+                length, f"1*{length.numerator}/{length.denominator}")
   def baseOctaveChange(self,change):
       self.base_octave = addOctaves(change,self.base_octave)
   def __call__(self,figures,nBeams,dots,octave,accidental,tremolo,word,line,pitch_ties=None):
@@ -1851,6 +1855,12 @@ def getLY(score,headers=None,have_final_barline=True):
                 out.append(r'\mark \markup{ \box { "%s" } }' % word[-1])
             elif re.match(r"R\*[1-9][0-9]*$",word):
                 if not western: out.append(r"\set Score.skipBars = ##t \override MultiMeasureRest #'expand-limit = #1 ") # \compressFullBarRests on Lilypond 2.20, \compressEmptyMeasures on 2.22, both map to \set Score.skipBars
+                if not notehead_markup.barPos:
+                    if notehead_markup.barNo > 1:
+                        out.append(f"| %{{ bar {notehead_markup.barNo}: %}}")
+                    # Keep repeat-injection markers in printed-cell order.
+                    notehead_markup.barNo += 1
+                    notehead_markup.current_accidentals = {}
                 out.append(r"R"+notehead_markup.wholeBarRestLen()+word[1:])
             elif re.fullmatch(r'LayoutBar:[1-9][0-9]*/[1-9][0-9]*', word):
                 # Synthetic bar length for an incomplete or irregular tuplet.

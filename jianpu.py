@@ -318,6 +318,43 @@ def write_pdf_notehead_audit(score_pdf: Path, mxl: Path, work: Path, stem: str) 
     return report
 
 
+def recover_pdf_multirests(score_pdf: Path, mxl: Path, work: Path, stem: str,
+                           *, recognize: bool = False) -> tuple[Path, dict[int, int]]:
+    """Use numbered source rest cells before running reports or rendering."""
+    from core.utils import atomic_write_text
+
+    protected = {score_pdf.resolve(), mxl.resolve()}
+    report = work / f'{stem}.pdf-multirests.json'
+    enriched = work / f'{stem}.pdf-multirests.musicxml'
+    while report.resolve() in protected:
+        report = report.with_name(report.stem + '.report.json')
+    while enriched.resolve() in protected:
+        enriched = enriched.with_name(enriched.stem + '.derived.musicxml')
+    data = {'source_pdf': str(score_pdf.resolve()), 'source_musicxml': str(mxl.resolve())}
+    try:
+        from core.omr.numbered_rests import reconcile_pdf_numbered_rests
+
+        data.update(source_pdf_sha256=_sha256_file(score_pdf), source_musicxml_sha256=_sha256_file(mxl))
+        root, counts, decisions, changed = reconcile_pdf_numbered_rests(score_pdf, mxl, recognize=recognize)
+        if changed:
+            import xml.etree.ElementTree as ET
+            atomic_write_text(enriched, ET.tostring(root, encoding='unicode', xml_declaration=True))
+        used = enriched if changed else mxl
+        data.update(status='inferred' if changed else 'checked',
+                    used_musicxml=str(used.resolve()), used_musicxml_sha256=_sha256_file(used),
+                    decisions=decisions)
+        atomic_write_text(report, json.dumps(data, ensure_ascii=False, indent=2))
+        pending = sum('musicxml_index' not in item for item in decisions)
+        if counts or pending:
+            print(f'[multirest] {len(counts)} 处长休止确定格位与数字，{pending} 处待校对。报告：{report}')
+        return used, counts
+    except Exception as exc:
+        data.update(status='error', error=str(exc))
+        atomic_write_text(report, json.dumps(data, ensure_ascii=False, indent=2))
+        print(f'[multirest] 核对失败，继续使用识谱结果：{exc}', file=sys.stderr)
+        return mxl, {}
+
+
 def recover_pdf_keys(score_pdf: Path, mxl: Path, work: Path, stem: str) -> Path:
     """Move corroborated delayed keys in a derived XML, preserving the input."""
     report = work / f'{stem}.pdf-keys.json'
@@ -532,7 +569,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument('--no-vector-wedges', action='store_true',
                     help='不从 PDF 矢量线条推断渐强渐弱线')
     ap.add_argument('--no-pdf-audit', action='store_true',
-                    help='不生成 PDF 符头位置和多小节休止数字核对报告')
+                    help='不生成可选的 PDF 符头核对报告')
     ap.add_argument('--no-vector-keys', action='store_true',
                     help='不依据 PDF 推断识谱中延迟的调号位置')
     ap.add_argument('--no-vector-slurs', action='store_true',
@@ -642,12 +679,11 @@ def main(argv: list[str]) -> int:
             mxl = omr_to_musicxml(score, work, use_gpu=use_gpu, backend=args.backend, strict=args.strict)
     title = args.title or score.stem
     multirest_counts = {}
-    if is_pdf and not args.no_pdf_audit:
-        audit = write_pdf_notehead_audit(score, mxl, work, base.name)
-        if isinstance(audit, Path) and audit.is_file():
-            entries = json.loads(audit.read_text(encoding='utf-8')).get('measures', [])
-            multirest_counts = {item['musicxml_measure_index']: item['printed_rest_measures']
-                                for item in entries if item['status'] == 'printed_multirest_count_detected'}
+    if is_pdf:
+        mxl, multirest_counts = recover_pdf_multirests(score, mxl, work, base.name,
+                                                     recognize=args.mxl is None)
+        if not args.no_pdf_audit:
+            write_pdf_notehead_audit(score, mxl, work, base.name)
     if is_pdf and not args.no_vector_keys:
         mxl = recover_pdf_keys(score, mxl, work, base.name)
     if is_pdf and not args.no_vector_slurs:

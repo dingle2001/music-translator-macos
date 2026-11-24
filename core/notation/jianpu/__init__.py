@@ -345,6 +345,32 @@ def build_jianpu_ly_text_from_measures(
     return '\n'.join(header)
 
 
+def _expanded_rest_groups(part):
+    """Locate intact, consecutively encoded MusicXML multi-bar rests."""
+    from music21 import note, spanner, stream
+
+    measures = list(part.getElementsByClass(stream.Measure))
+    indices = {id(measure): index for index, measure in enumerate(measures)}
+    groups = {}
+    for group in part.recurse().getElementsByClass(spanner.MultiMeasureRest):
+        rests = list(group.getSpannedElements())
+        positions = [indices.get(id(rest.getContextByClass(stream.Measure))) for rest in rests]
+        if len(positions) < 2 or any(index is None for index in positions):
+            continue
+        first = positions[0]
+        if positions != list(range(first, first + len(rests))):
+            continue
+        cells = measures[first:first + len(rests)]
+        if (all(isinstance(rest, note.Rest) and rest.fullMeasure is True
+                and rest.quarterLength == rests[0].quarterLength
+                and list(cell.recurse().notesAndRests) == [rest]
+                for cell, rest in zip(cells, rests))
+                and all(all(element is rest for element in cell)
+                        for cell, rest in zip(cells[1:], rests[1:]))):
+            groups[first + 1] = len(rests)
+    return groups
+
+
 @overload
 def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                           composer: str = '', tempo: int = 0,
@@ -452,6 +478,7 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
         f'{sum(len(s) for s in _sections)} 个小节', _logging.DEBUG,
     )
 
+    first_section_covered = set()
     for section_idx, measures in enumerate(_sections):
         if section_idx > 0:
             header.append('NextPart')
@@ -477,6 +504,12 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
             # A caller-supplied initial tempo overrides source marks at time zero.
             tempo_marks[0] = [(offset, word) for offset, word in tempo_marks[0]
                               if abs(offset) >= 1e-6]
+        rest_groups = {} if use_strict_timing else _expanded_rest_groups(_section_parts[section_idx])
+        covered = {index + step for index, count in rest_groups.items() for step in range(1, count)}
+        if section_idx == 0:
+            first_section_covered = covered
+        if multirest_counts and len(_sections) == 1 and not use_strict_timing:
+            rest_groups.update(multirest_counts)
         for i in range(0, len(measures), measures_per_line):
             line_measures = measures[i:i + measures_per_line]
             try:
@@ -487,14 +520,17 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                                               wedge_marks.get(i + offset, []))
                     for offset, m in enumerate(line_measures)
                 ]
-                if multirest_counts and len(_sections) == 1 and not use_strict_timing:
-                    measure_texts = annotate_multirests(measure_texts, i, multirest_counts)
+                if rest_groups:
+                    measure_texts = annotate_multirests(measure_texts, i, rest_groups)
                 changes = getattr(measures, 'key_changes', {})
                 measure_texts = [f'{changes[i + offset][1]} {text}'
                                  if i + offset in changes else text
                                  for offset, text in enumerate(measure_texts)]
-                header.append(
-                    ' | '.join(_with_time_signatures(measure_texts, i, section_time_sigs)) + ' |')
+                visible = [text for offset, text in enumerate(
+                    _with_time_signatures(measure_texts, i, section_time_sigs), i + 1)
+                           if offset not in covered]
+                if visible:
+                    header.append(' | '.join(visible) + ' |')
             except Exception as exc:
                 log_message(
                     f'[jianpu] 处理声部 {section_idx} 小节组 [{i}:{i+measures_per_line}] 失败: {exc}',
@@ -509,12 +545,24 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
         _repeat_barlines: dict[int, dict[str, bool]] = (
             _extract_part_repeat_barlines(_first_part) if _first_part is not None else {}
         )
+        if first_section_covered:
+            _repeat_barlines = {
+                index - sum(cell <= index for cell in first_section_covered): markers
+                for index, markers in _repeat_barlines.items()
+                if index + 1 not in first_section_covered
+            }
         return text, _voice_groups, _repeat_barlines
     return text
 
 
 def annotate_multirests(texts: list[str], start: int, counts: dict[int, int]) -> list[str]:
-    """Label audited full-bar rests without changing the printed bar count."""
-    return [re.sub(r'(?<!\S)([cqsdh]?0[.]*)(?!\S)', rf'\1 ^"{count}"', text, count=1)
-            if (count := counts.get(start + offset + 1)) is not None else text
-            for offset, text in enumerate(texts)]
+    """Replace one full-rest cell with a native numbered multi-bar rest."""
+    result = []
+    for offset, text in enumerate(texts, start + 1):
+        count = counts.get(offset)
+        if count is not None:
+            # Keep tempo, time and other direction tokens in their source order.
+            text = re.sub(r'(?<!\S)[cqsdh]?0\.*(?:\s+-(?=\s|$))*(?!\S)',
+                          f'R*{count}', text, count=1)
+        result.append(text)
+    return result

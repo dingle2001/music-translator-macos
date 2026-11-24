@@ -216,6 +216,37 @@ def _flatten_parts_for_midi(score):
     return result
 
 
+def _expand_compact_rests_for_midi(score, counts):
+    """Restore playback time for the source's one-cell rest representation."""
+    from music21 import note, stream
+
+    if not counts or len(score.parts) != 1:
+        return
+    part = score.parts[0]
+    measures = list(part.getElementsByClass(stream.Measure))
+    extra = 0
+    for index, measure in enumerate(measures, 1):
+        onset = part.elementOffset(measure) + extra
+        if extra:
+            part.setElementOffset(measure, onset)
+        count = counts.get(index, 1)
+        if count <= 1:
+            continue
+        length = measure.duration.quarterLength
+        if length <= 0:
+            continue
+        right_barline = measure.rightBarline
+        measure.rightBarline = None
+        for step in range(1, count):
+            continuation = stream.Measure(number=measure.number)
+            rest = note.Rest(quarterLength=length)
+            rest.fullMeasure = True
+            continuation.insert(0, rest)
+            part.insert(onset + step * length, continuation)
+        continuation.rightBarline = right_barline
+        extra += (count - 1) * length
+
+
 def render_midi_from_score(score, midi_path: Path) -> bool:
     """Export a music21 score to a MIDI file; return True on success.
     All parts are forced to Piano (MIDI program 1) before export.
@@ -868,6 +899,8 @@ def render_score_to_jianpu_pdf(
             return False, [], {}
         log_message('文本版 jianpu-ly 失败，尝试严格按拍号重建简谱。', logging.WARNING)
 
+    if multirest_counts:
+        log_message('[jianpu] 备用排版不能保留已核对的多小节休止，请查看长休止报告。', logging.WARNING)
     strict_txt_content = build_jianpu_ly_text(score, title, use_strict_timing=True,
                                                composer=composer, tempo=tempo,
                                                pitch_mode=pitch_mode, fixed_tonic=fixed_tonic)
@@ -1179,6 +1212,7 @@ def generate_jianpu_pdf_from_mxl(
             import copy
             midi_score = copy.deepcopy(source_score)
             strip_grace_notes(midi_score)
+            _expand_compact_rests_for_midi(midi_score, multirest_counts)
             if not render_midi_from_score(midi_score, midi_output_path):
                 log_message('简谱 MIDI 生成失败，跳过 MIDI 输出，继续生成简谱 PDF。', logging.WARNING)
                 if strict:

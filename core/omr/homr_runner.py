@@ -626,15 +626,13 @@ def _merge_homr_musicxml_pages(page_mxl_files: list[Path], output_path: Path) ->
                         # 第一小节写 <print>，合并时若不留标记，上一页最后一
                         # 行会和本页第一行粘成一行；对齐阶段就无从知道页码
                         # 已经翻过，可能把上一页的小节分配给本页谱表。这里
-                        # 显式补一个换页标记（已有 new-page/new-system 则保留）。
+                        # 显式补一个换页标记，并保留已有的换行属性。
                         prints = new_m.findall('print')
-                        if not any(pr.get('new-page') or pr.get('new-system')
-                                   for pr in prints):
+                        if not any(pr.get('new-page') == 'yes' for pr in prints):
                             if prints:
                                 prints[0].set('new-page', 'yes')
                             else:
-                                new_m.insert(0, _ET.Element('print',
-                                                            {'new-page': 'yes'}))
+                                new_m.insert(0, _ET.Element('print', {'new-page': 'yes'}))
                     base_part.append(new_m)
                 for idx, measure in enumerate(base_part.findall('measure'), start=1):
                     measure.set('number', str(idx))
@@ -1056,10 +1054,8 @@ def run_homr_batch(
     try:
         from .multirest_collapse import collapse_multirests_for_pdf_page
         collapse_multirests_for_pdf_page(source_image, mxl, page_index=0, log=log_message)
-    except ValueError:
-        raise
     except Exception as _mr_exc:
-        log_message(f'[homr] 多小节休止折叠异常（不影响输出）：{_mr_exc}', logging.WARNING)
+        log_message(f'[homr] 多小节休止折叠未应用，保留识谱结果：{_mr_exc}', logging.WARNING)
 
     from .vector_whole_chords import recover_vector_whole_chords
     recover_vector_whole_chords(source_image, mxl, page_index=0, log=log_message)
