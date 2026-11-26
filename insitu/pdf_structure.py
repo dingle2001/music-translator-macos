@@ -59,7 +59,10 @@ _MIN_RULES_PER_STAFF = 5
 # ignored regardless of the font.
 _PUA_DIGIT = {chr(0xF030 + i): str(i) for i in range(10)}
 _MUSIC_FONT_PREFIXES = ("Maestro", "Opus")
-# Measure numbers use Times New Roman Italic in both MuseScore 3 and 4 exports.
+_NON_BAR_NUMBER_FONTS = (
+    "Maestro", "Opus", "Bravura", "Emmentaler", "Leland", "Petaluma", "Sonata", "Gonville",
+)
+# Measure numbers use Times New Roman Italic in MuseScore 3/4, or arbitrary serif/sans/CID fonts in other engravers.
 _MEASURE_NUMBER_FONT = "TimesNewRomanPS-Italic"
 
 
@@ -331,30 +334,44 @@ def box_measure_counts(page, staff: Staff, barlines: list[float]) -> list[int]:
 
 
 def measure_numbers(page, staff: Staff) -> Optional[int]:
-    """The measure number MuseScore prints in the left margin for *staff*.
+    """The measure number printed in the left margin above *staff*.
 
-    This is ground truth for the measure-number ruler: it lets us check that
-    consecutive staves' spans abut (`start + count == next start`) instead of
-    trusting the box count alone.  The number is Times New Roman Italic at the
-    staff's left edge (indented first systems included), 5-50pt above the
-    staff's top rule.
+    Prefers MuseScore's Times New Roman Italic; falls back to any non-music
+    text font aligned with the staff's left edge and positioned right above the
+    top staff line (excluding page headers/numbers higher up the page).
     """
     metrics = staff.metrics
-    best: Optional[int] = None
+    preferred: list[tuple[float, int]] = []
+    fallback: list[tuple[float, int]] = []
+    x_tol = max(metrics.measure_number_margin, 1.5 * staff.line_spacing)
+    y_max = min(metrics.measure_number_top, 6.5 * staff.line_spacing)
     for block in page.get_text("dict")["blocks"]:
         for line in block.get("lines", []):
             for span in line["spans"]:
-                if not span["font"].startswith(_MEASURE_NUMBER_FONT):
+                font = str(span.get("font") or "")
+                base_font = font.split("+", 1)[-1] if "+" in font and len(font.split("+", 1)[0]) == 6 else font
+                if any(base_font.startswith(p) or font.startswith(p) for p in _NON_BAR_NUMBER_FONTS):
                     continue
                 x0, y0, _, y1 = span["bbox"]
                 text = span["text"].strip()
                 if not text.isdigit():
                     continue
-                if abs(x0 - staff.x0) > metrics.measure_number_margin:
-                    continue                 # not the left-margin ruler
-                if 0.0 <= staff.top - y1 <= metrics.measure_number_top:
-                    best = int(text)
-    return best
+                val = int(text)
+                if not (1 <= val <= 9999):
+                    continue
+                dy = staff.top - y1
+                if font.startswith(_MEASURE_NUMBER_FONT):
+                    if abs(x0 - staff.x0) <= metrics.measure_number_margin and 0.0 <= dy <= metrics.measure_number_top:
+                        preferred.append((dy, val))
+                elif abs(x0 - staff.x0) <= x_tol and -0.5 * staff.line_spacing <= dy <= y_max:
+                    fallback.append((abs(dy), val))
+    if preferred:
+        preferred.sort(key=lambda item: item[0])
+        return preferred[0][1]
+    if fallback:
+        fallback.sort(key=lambda item: item[0])
+        return fallback[0][1]
+    return None
 
 
 def document_staves(pdf_path) -> list[Staff]:

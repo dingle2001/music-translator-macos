@@ -11,7 +11,7 @@ import pymupdf
 
 from core.notation.musicxml_wedges import read_musicxml_bytes
 from insitu.pdf_structure import extract_staves, measure_numbers, staff_barlines
-from .multirest_collapse import _read_state
+from .multirest_collapse import _absorb_attributes, _read_state
 from .vector_tempos import _page_marks, printed_rest_strokes, printed_rest_info
 
 
@@ -80,13 +80,24 @@ def _matching_line(block, slots, *, recognize):
             lengths = (1,) if ordinary else ()
         else:
             lengths = [0]
-            if index < len(measures) and (_full_rest(measures[index]) or _empty_rest_cell(measures[index])):
+            if index < len(measures) and (_full_rest(measures[index]) or _empty_rest_cell(measures[index])
+                                          or (recognize and not _pitched_cell(measures[index]))):
                 style = _rest_style(measures[index])
-                if style in (None, count) or recognize and _empty_rest_cell(measures[index]):
+                if style in (None, count) or recognize:
                     lengths.append(1)
                     if (_full_rest(measures[index]) and index + count <= len(measures)
                             and all(_bare_rest(m) for m in measures[index + 1:index + count])):
                         lengths.append(count)
+                    if recognize:
+                        max_k = min(count, len(measures) - index)
+                        for k in range(2, max_k + 1):
+                            if k in lengths:
+                                continue
+                            if all((_full_rest(m) or _empty_rest_cell(m) or not _pitched_cell(m))
+                                   for m in measures[index + 1:index + k]):
+                                lengths.append(k)
+                            else:
+                                break
         paths = []
         for length in lengths:
             for tail in search(slot + 1, index + length):
@@ -98,7 +109,7 @@ def _matching_line(block, slots, *, recognize):
     # Normal case. A source line already matching cell-for-cell should not
     # be reinterpreted as a mixture of missing and expanded rest groups.
     if len(measures) == len(slots) and all(
-            (_full_rest(m) or _empty_rest_cell(m)) if count else
+            (_full_rest(m) or _empty_rest_cell(m) or (recognize and not _pitched_cell(m))) if count else
             (not heads or _pitched_cell(m)) for m, (count, heads) in zip(measures, slots)):
         return (1,) * len(slots)
     if len(slots) > 100:
@@ -153,19 +164,25 @@ def _prepare_line(block, slots, states, *, recognize):
                 return None
         if count:
             empty = take == 1 and _empty_rest_cell(measure)
+            non_full_rest = take >= 1 and recognize and not _full_rest(measure) and not _pitched_cell(measure)
             declared = _rest_style(measure)
             conflict = declared not in (None, count)
-            if conflict and not (recognize and empty):
+            if conflict and not recognize:
                 actions.append((slot, ('count_conflict_review', declared)))
                 measures.append(measure)
                 cursor += take
                 continue
-            if take != 1 or empty or declared is not None:
+            if take != 1 or empty or non_full_rest or declared is not None:
                 measure = deepcopy(measure)
-                if empty:
+                if take > 1:
+                    for _, victim in block[cursor + 1:cursor + take]:
+                        _absorb_attributes(measure, deepcopy(victim))
+                if empty or non_full_rest:
                     inferred = _whole_rest(measure.get('number', str(index + 1)), states[index + 1])
                     if inferred is None:
                         return None
+                    for old_note in list(measure.findall('note')):
+                        measure.remove(old_note)
                     barline = measure.find("barline[@location='right']")
                     at = list(measure).index(barline) if barline is not None else len(measure)
                     measure.insert(at, inferred[0])
